@@ -1,0 +1,42 @@
+name: Gold Liquidity Sweep Scanner (Strategy 2)
+
+on:
+  schedule:
+    # Build Asian range every 15 minutes, 00:00-06:00 UTC
+    - cron: "*/15 0-6 * * *"
+    # Monitor sweep / MSS / FVG / pending entry every 1 minute, 07:00-10:59 UTC
+    - cron: "* 7-10 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run liquidity sweep scanner
+        env:
+          TWELVE_DATA_KEY: ${{ secrets.TWELVE_DATA_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python scan_liquidity_sweep.py
+
+      - name: Save state back to repo
+        run: |
+          git config user.name "gold-scanner-bot"
+          git config user.email "actions@github.com"
+          git add sweep_state.json || true
+          git diff --quiet && git diff --staged --quiet || git commit -m "Update sweep scanner state"
+          git push || true
