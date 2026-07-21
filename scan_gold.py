@@ -1,8 +1,7 @@
 """
 XAUUSD Trend-Pullback Scanner — Strategy 1
-Now includes session start/close heads-up + periodic status updates
-so you know the bot is alive and what it's seeing, not just silent
-until a trade signal fires.
+Talks to you every single hour like a person watching the chart with you,
+not just a silent script that fires once in a while.
 """
 
 import os
@@ -13,36 +12,101 @@ import pandas as pd
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
-# ============================================================
-# CONFIG
-# ============================================================
 TWELVE_DATA_KEY   = os.environ["TWELVE_DATA_KEY"]
 TELEGRAM_TOKEN    = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID  = os.environ["TELEGRAM_CHAT_ID"]
 
-SYMBOL    = "XAU/USD"
-INTERVAL  = "4h"
-OUTPUTSIZE = 300
+SYMBOL, INTERVAL, OUTPUTSIZE = "XAU/USD", "4h", 300
 STATE_FILE = "state.json"
 
 EMA_FAST, EMA_TREND, EMA_MACRO = 20, 50, 200
-RSI_LEN = 14
-RSI_LOW, RSI_HIGH = 40, 50
-ATR_LEN = 14
-PULLBACK_ATR_MULT = 0.6
-ATR_STOP_MULT = 1.5
+RSI_LEN, RSI_LOW, RSI_HIGH = 14, 40, 50
+ATR_LEN, PULLBACK_ATR_MULT, ATR_STOP_MULT = 14, 0.6, 1.5
 RR1, RR2 = 1.0, 2.0
 
 US_DATA_WINDOW = ("08:20", "09:10")
 FOMC_WINDOW    = ("13:55", "14:50")
-
-# Best-liquidity window (London-New York overlap), UTC, approx (ignores DST shifts)
 OVERLAP_START_H, OVERLAP_END_H = 13, 16
 
-STATUS_EMOJIS = ["📊", "🔍", "🧐", "⚙️", "🛰️", "🔭"]
-IDLE_EMOJIS   = ["😴", "🌙", "☕", "🤷"]
-GREEN_EMOJIS  = ["🟢", "✅", "🚀"]
-RED_EMOJIS    = ["🔴", "🛑", "⚠️"]
+# ============================================================
+# PERSONALITY: message building blocks
+# ============================================================
+OPENERS = [
+    "👋 أنا لسا هنا، خلني أحدثك عن آخر وضع.",
+    "🕓 مرت ساعة، وهذا اللي شفته بالسوق.",
+    "📌 تحديث سريع قبل لا تسأل وش صاير.",
+    "🧠 خلاصة اللي راقبته للتو:",
+    "🔔 ما نسيتك، هذا آخر شي عندي.",
+    "☕ استريح شوي وخذ هالتحديث.",
+    "📋 تقرير الساعة جاهز:",
+]
+
+TREND_TALK = {
+    "uptrend": [
+        "الاتجاه العام لسا صاعد بقوة 📈، الشمعات فوق EMA50 وEMA200 مرتبة صح.",
+        "الترند صاعد وواضح 🟢، ما فيه تردد بالاتجاه العام حاليًا.",
+        "الذهب متمسك بالصعود 📈، الهيكل العام لسا سليم لصالح الشراء.",
+    ],
+    "downtrend": [
+        "الاتجاه هابط بوضوح 📉، البائعين متحكمين حاليًا.",
+        "الترند نازل 🔴، EMA50 تحت EMA200 وما فيه علامات ارتداد قوي.",
+        "السوق مستمر بالهبوط 📉، لسا الزخم لصالح البيع.",
+    ],
+    "ranging": [
+        "الوضع متذبذب حاليًا 🌊، ما فيه اتجاه واضح نعتمد عليه.",
+        "السوق عرضي هالفترة 😐، أفضل شي ننتظر كسر واضح.",
+        "حركة جانبية بدون قرار 🤏، صبر شوي أحسن من دخول عشوائي.",
+    ],
+}
+
+PULLBACK_TALK_NEAR = [
+    "السعر قريب من منطقة الارتداد (EMA20) 🎯، فيه احتمال تتكون فرصة قريبًا.",
+    "قربنا من منطقة الدخول المحتملة 👀، راقب معي الشمعة الجاية.",
+    "منطقة الارتداد قريبة 📏، لو تأكدت الشمعة ممكن تجيك إشارة قريب.",
+]
+PULLBACK_TALK_FAR = [
+    "السعر لسا بعيد عن منطقة الارتداد المثالية 📐، نصبر أكثر.",
+    "ما وصلنا لمنطقة الدخول بعد 🚶، السعر بعيد شوي عن EMA20.",
+    "بعدنا عن نقطة الفرصة المثالية 📍، ما فيه داعي نستعجل.",
+]
+
+RSI_TALK = [
+    "RSI عند {rsi:.1f}، {rsi_note}",
+]
+
+BLACKOUT_ON = [
+    "🔇 تنبيه: فيه حظر أخبار شغال حاليًا، حتى لو صارت إشارة بنؤجلها.",
+    "🔇 نافذة أخبار مهمة حاليًا، البوت بيتصرف بحذر أكثر.",
+]
+BLACKOUT_OFF = [
+    "🔊 ما فيه حظر أخبار حاليًا، الطريق مفتوح لو صارت إشارة.",
+    "🔊 الوضع طبيعي من ناحية الأخبار، نكمل مراقبة عادية.",
+]
+
+CLOSERS_IDLE = [
+    "😴 بس هذا وضعنا الحين، ولا فيه إشارة جاهزة.",
+    "🤷 لسا نراقب، ما توفرت كل الشروط سوا.",
+    "⏳ صبر شوي، الفرصة الزينة تستاهل الانتظار.",
+    "🔍 نكمل المراقبة، أخبرك أول ما يصير شي مهم.",
+]
+
+
+def rsi_note(rsi_val, direction_hint):
+    if direction_hint == "uptrend":
+        if RSI_LOW <= rsi_val <= RSI_HIGH:
+            return "بالضبط بمنطقة الشراء المثالية، هذا مشجع 👍"
+        elif rsi_val < RSI_LOW:
+            return "أقل من منطقتنا المفضلة، يحتاج يرتفع شوي."
+        else:
+            return "فوق منطقة الشراء المثالية، يمكن السعر متمدد شوي."
+    elif direction_hint == "downtrend":
+        if (100 - RSI_HIGH) <= rsi_val <= (100 - RSI_LOW):
+            return "بالضبط بمنطقة البيع المثالية 👍"
+        elif rsi_val > (100 - RSI_LOW):
+            return "أعلى من منطقتنا المفضلة، يحتاج ينزل شوي."
+        else:
+            return "تحت منطقة البيع المثالية، يمكن السعر متمدد بالهبوط."
+    return "السوق عرضي، RSI ما يعطي إشارة قوية حاليًا."
 
 
 # ============================================================
@@ -50,10 +114,8 @@ RED_EMOJIS    = ["🔴", "🛑", "⚠️"]
 # ============================================================
 def fetch_candles():
     url = "https://api.twelvedata.com/time_series"
-    params = {
-        "symbol": SYMBOL, "interval": INTERVAL, "outputsize": OUTPUTSIZE,
-        "apikey": TWELVE_DATA_KEY, "order": "ASC",
-    }
+    params = {"symbol": SYMBOL, "interval": INTERVAL, "outputsize": OUTPUTSIZE,
+              "apikey": TWELVE_DATA_KEY, "order": "ASC"}
     r = requests.get(url, params=params, timeout=30)
     data = r.json()
     if "values" not in data:
@@ -65,93 +127,57 @@ def fetch_candles():
     return df.sort_values("datetime").reset_index(drop=True)
 
 
-# ============================================================
-# INDICATORS
-# ============================================================
 def add_indicators(df):
     df["ema_fast"] = df["close"].ewm(span=EMA_FAST, adjust=False).mean()
     df["ema_trend"] = df["close"].ewm(span=EMA_TREND, adjust=False).mean()
     df["ema_macro"] = df["close"].ewm(span=EMA_MACRO, adjust=False).mean()
-
     delta = df["close"].diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
+    gain, loss = delta.clip(lower=0), -delta.clip(upper=0)
     avg_gain = gain.ewm(alpha=1 / RSI_LEN, adjust=False).mean()
     avg_loss = loss.ewm(alpha=1 / RSI_LEN, adjust=False).mean()
-    rs = avg_gain / avg_loss
-    df["rsi"] = 100 - (100 / (1 + rs))
-
-    high_low = df["high"] - df["low"]
-    high_close = (df["high"] - df["close"].shift()).abs()
-    low_close = (df["low"] - df["close"].shift()).abs()
-    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    df["rsi"] = 100 - (100 / (1 + avg_gain / avg_loss))
+    hl = df["high"] - df["low"]
+    hc = (df["high"] - df["close"].shift()).abs()
+    lc = (df["low"] - df["close"].shift()).abs()
+    tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
     df["atr"] = tr.ewm(alpha=1 / ATR_LEN, adjust=False).mean()
     return df
 
 
-# ============================================================
-# SIGNAL LOGIC
-# ============================================================
 def check_signal(df):
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
-
+    last, prev = df.iloc[-1], df.iloc[-2]
     uptrend = last["close"] > last["ema_trend"] > last["ema_macro"]
     downtrend = last["close"] < last["ema_trend"] < last["ema_macro"]
-
-    dist_from_fast = abs(last["close"] - last["ema_fast"])
-    near_pullback = dist_from_fast <= (last["atr"] * PULLBACK_ATR_MULT)
-
+    dist = abs(last["close"] - last["ema_fast"])
+    near_pullback = dist <= (last["atr"] * PULLBACK_ATR_MULT)
     rsi_long_zone = (RSI_LOW <= last["rsi"] <= RSI_HIGH) and (last["rsi"] > prev["rsi"])
     rsi_short_zone = ((100 - RSI_HIGH) <= last["rsi"] <= (100 - RSI_LOW)) and (last["rsi"] < prev["rsi"])
-
     body = abs(last["close"] - last["open"])
-    lower_wick = min(last["open"], last["close"]) - last["low"]
-    upper_wick = last["high"] - max(last["open"], last["close"])
-
-    bullish_pin = lower_wick >= body * 1.5 and last["close"] > last["open"]
-    bullish_engulf = (last["close"] > last["open"] and last["open"] <= prev["close"]
-                       and last["close"] >= prev["open"] and prev["close"] < prev["open"])
-    bullish_reject = bullish_pin or bullish_engulf
-
-    bearish_pin = upper_wick >= body * 1.5 and last["close"] < last["open"]
-    bearish_engulf = (last["close"] < last["open"] and last["open"] >= prev["close"]
-                       and last["close"] <= prev["open"] and prev["close"] > prev["open"])
-    bearish_reject = bearish_pin or bearish_engulf
-
-    long_signal = uptrend and near_pullback and rsi_long_zone and bullish_reject
-    short_signal = downtrend and near_pullback and rsi_short_zone and bearish_reject
-
+    lw = min(last["open"], last["close"]) - last["low"]
+    uw = last["high"] - max(last["open"], last["close"])
+    bullish = (lw >= body * 1.5 and last["close"] > last["open"]) or \
+              (last["close"] > last["open"] and last["open"] <= prev["close"] and last["close"] >= prev["open"] and prev["close"] < prev["open"])
+    bearish = (uw >= body * 1.5 and last["close"] < last["open"]) or \
+              (last["close"] < last["open"] and last["open"] >= prev["close"] and last["close"] <= prev["open"] and prev["close"] > prev["open"])
+    long_signal = uptrend and near_pullback and rsi_long_zone and bullish
+    short_signal = downtrend and near_pullback and rsi_short_zone and bearish
     bias = "uptrend" if uptrend else ("downtrend" if downtrend else "ranging")
-    return long_signal, short_signal, last, bias
+    return long_signal, short_signal, last, bias, near_pullback
 
 
-# ============================================================
-# NEWS BLACKOUT
-# ============================================================
 def in_blackout_now():
     now_et = datetime.now(ZoneInfo("America/New_York"))
     if now_et.weekday() >= 5:
         return False
     hm = now_et.strftime("%H:%M")
-
-    def in_window(t, window):
-        return window[0] <= t <= window[1]
-
-    return in_window(hm, US_DATA_WINDOW) or in_window(hm, FOMC_WINDOW)
+    return US_DATA_WINDOW[0] <= hm <= US_DATA_WINDOW[1] or FOMC_WINDOW[0] <= hm <= FOMC_WINDOW[1]
 
 
-# ============================================================
-# TELEGRAM
-# ============================================================
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": message}, timeout=15)
 
 
-# ============================================================
-# STATE
-# ============================================================
 def load_state():
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE) as f:
@@ -164,9 +190,6 @@ def save_state(state):
         json.dump(state, f)
 
 
-# ============================================================
-# MAIN
-# ============================================================
 def main():
     now_utc = datetime.now(timezone.utc)
     today_str = now_utc.strftime("%Y-%m-%d")
@@ -174,68 +197,51 @@ def main():
 
     state = load_state()
     if state.get("date") != today_str:
-        state = {
-            "date": today_str,
-            "last_alert_time": state.get("last_alert_time"),
-            "last_status_time": None,
-            "overlap_start_sent": False,
-            "overlap_end_warned": False,
-        }
+        state = {"date": today_str, "last_alert_time": state.get("last_alert_time"),
+                  "overlap_start_sent": False, "overlap_end_warned": False}
 
-    # --- Session start heads-up (London-NY overlap) ---
     if hour == OVERLAP_START_H and not state.get("overlap_start_sent"):
-        send_telegram(
-            f"{random.choice(GREEN_EMOJIS)} بدأت نافذة أفضل سيولة اليوم (تقاطع لندن-نيويورك)! "
-            f"{random.choice(STATUS_EMOJIS)} راقب معي، الفرص الأقوى عادة تطلع بهالفترة 👀"
-        )
+        send_telegram("🚀 بدأت نافذة أفضل سيولة اليوم (لندن-نيويورك)! خليني أراقب بتركيز أكبر 👀")
         state["overlap_start_sent"] = True
         save_state(state)
 
-    # --- Session closing soon heads-up ---
     if hour == OVERLAP_END_H - 1 and not state.get("overlap_end_warned"):
-        send_telegram(
-            f"{random.choice(RED_EMOJIS)} تنبيه: أفضل نافذة سيولة اليوم توشك تخلص خلال أقل من ساعة ⏳ "
-            "لو ما فيه إشارة لين الحين، الأرجح نستنى ليوم ثاني 🌙"
-        )
+        send_telegram("⏳ باقي أقل من ساعة على انتهاء أفضل نافذة سيولة اليوم.")
         state["overlap_end_warned"] = True
         save_state(state)
 
-    df = fetch_candles()
-    df = add_indicators(df)
-
+    df = add_indicators(fetch_candles())
     if len(df) < EMA_MACRO + 5:
-        print("Not enough data yet for EMA200.")
+        print("Not enough data yet.")
         save_state(state)
         return
 
-    long_signal, short_signal, last, bias = check_signal(df)
+    long_signal, short_signal, last, bias, near_pullback = check_signal(df)
     candle_time = str(last["datetime"])
+    blackout = in_blackout_now()
 
-    # --- Periodic status update, once per new H4 candle ---
-    if state.get("last_status_time") != candle_time:
-        bias_txt = {"uptrend": "صاعد 📈", "downtrend": "هابط 📉", "ranging": "متذبذب 🌊"}[bias]
-        blackout_txt = "🔇 فيه حظر أخبار حاليًا" if in_blackout_now() else "🔊 ما فيه حظر أخبار"
-        send_telegram(
-            f"{random.choice(STATUS_EMOJIS)} تحديث سريع من الاستراتيجية الأولى:\n"
-            f"السعر الحالي: {last['close']:.2f} 💰\n"
-            f"الاتجاه العام: {bias_txt}\n"
-            f"RSI: {last['rsi']:.1f}\n"
-            f"{blackout_txt}\n"
-            f"{random.choice(IDLE_EMOJIS)} لسا نراقب، ما فيه إشارة جاهزة هالشمعة."
-        )
-        state["last_status_time"] = candle_time
-        save_state(state)
+    # --- Hourly narrated status (every single run) ---
+    parts = [random.choice(OPENERS)]
+    parts.append(f"💰 السعر الحالي: {last['close']:.2f}")
+    parts.append(random.choice(TREND_TALK[bias]))
+    parts.append(random.choice(PULLBACK_TALK_NEAR if near_pullback else PULLBACK_TALK_FAR))
+    parts.append(f"📊 RSI: {last['rsi']:.1f} — {rsi_note(last['rsi'], bias)}")
+    parts.append(random.choice(BLACKOUT_ON if blackout else BLACKOUT_OFF))
 
-    if state.get("last_alert_time") == candle_time:
-        print("Already alerted for this candle. Skipping trade check.")
+    already_alerted_this_candle = state.get("last_alert_time") == candle_time
+    if not (long_signal or short_signal) or already_alerted_this_candle:
+        parts.append(random.choice(CLOSERS_IDLE))
+
+    send_telegram("\n".join(parts))
+
+    if already_alerted_this_candle:
+        print("Already alerted for this candle.")
         return
-
     if not (long_signal or short_signal):
-        print("No signal on latest closed candle.")
+        print("No trade signal this hour.")
         return
-
-    if in_blackout_now():
-        print("Signal found but inside news blackout window. Suppressed.")
+    if blackout:
+        print("Signal found but blackout active. Suppressed.")
         return
 
     atr = last["atr"]
@@ -243,33 +249,17 @@ def main():
     price = last["close"]
 
     if long_signal:
-        sl = price - stop_dist
-        tp1 = price + stop_dist * RR1
-        tp2 = price + stop_dist * RR2
-        msg = (
-            f"{random.choice(GREEN_EMOJIS)} GOLD BUY SIGNAL (XAUUSD) 🟡\n"
-            f"Entry: {price:.2f}\n"
-            f"Stop Loss: {sl:.2f} 🛑\n"
-            f"TP1 (1:{RR1}): {tp1:.2f} 🎯\n"
-            f"TP2 (1:{RR2}): {tp2:.2f} 🎯🎯\n"
-            "Risk 0.5-1% of account. Confirm chart before entering ✅"
-        )
+        sl, tp1, tp2 = price - stop_dist, price + stop_dist * RR1, price + stop_dist * RR2
+        msg = (f"🟢🚀 GOLD BUY SIGNAL (XAUUSD)\nEntry: {price:.2f}\nStop Loss: {sl:.2f} 🛑\n"
+               f"TP1 (1:{RR1}): {tp1:.2f} 🎯\nTP2 (1:{RR2}): {tp2:.2f} 🎯🎯\n"
+               "Risk 0.5-1% of account. Confirm chart before entering ✅")
     else:
-        sl = price + stop_dist
-        tp1 = price - stop_dist * RR1
-        tp2 = price - stop_dist * RR2
-        msg = (
-            f"{random.choice(RED_EMOJIS)} GOLD SELL SIGNAL (XAUUSD) 🟡\n"
-            f"Entry: {price:.2f}\n"
-            f"Stop Loss: {sl:.2f} 🛑\n"
-            f"TP1 (1:{RR1}): {tp1:.2f} 🎯\n"
-            f"TP2 (1:{RR2}): {tp2:.2f} 🎯🎯\n"
-            "Risk 0.5-1% of account. Confirm chart before entering ✅"
-        )
+        sl, tp1, tp2 = price + stop_dist, price - stop_dist * RR1, price - stop_dist * RR2
+        msg = (f"🔴🛑 GOLD SELL SIGNAL (XAUUSD)\nEntry: {price:.2f}\nStop Loss: {sl:.2f} 🛑\n"
+               f"TP1 (1:{RR1}): {tp1:.2f} 🎯\nTP2 (1:{RR2}): {tp2:.2f} 🎯🎯\n"
+               "Risk 0.5-1% of account. Confirm chart before entering ✅")
 
     send_telegram(msg)
-    print("Alert sent:", msg)
-
     state["last_alert_time"] = candle_time
     save_state(state)
 
