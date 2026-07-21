@@ -1,10 +1,15 @@
 """
 STRATEGY 2 — Asian Range Liquidity Sweep + MSS + FVG (XAUUSD)
-Talks to you every hour, including "off duty" hours outside the trading
-sessions, so there's never a silent hour.
+Sends a message exactly when the Asian session starts, an estimated
+probability of getting a trade today right when it ends, session
+start/close heads-up for London, and periodic status updates while
+actively monitoring. Off-duty hours get a light hourly check-in.
 
 LIMITATIONS: "GMT" treated as UTC; spread not verified (OHLC data only);
-swing/MSS detection uses closed 1m candles only.
+swing/MSS detection uses closed 1m candles only. The "probability" below
+is a rough heuristic based on how narrow/wide today's Asian range is —
+NOT a statistically backtested number. Treat it as a general heads-up,
+not a precise forecast.
 """
 
 import os
@@ -34,6 +39,10 @@ US_DATA_WINDOW = ("08:20", "09:10")
 FOMC_WINDOW    = ("13:55", "14:50")
 
 STATUS_MINUTE_INTERVAL = 30
+
+# Range-width heuristic thresholds (USD) for the probability estimate
+NARROW_RANGE_MAX = 3.0
+TYPICAL_RANGE_MAX = 6.0
 
 OFFDUTY_LINES = [
     "😴 برا أوقات شغلي الحين (آسيا 00:00-06:00 أو لندن 07:00-11:00 UTC)، خذ راحتك.",
@@ -93,9 +102,19 @@ def fresh_daily_state(today_str):
     return {
         "date": today_str, "asian_high": None, "asian_low": None, "sweep": None,
         "pending_signal": None, "trade_taken_today": False,
-        "asian_start_sent": False, "london_start_sent": False, "closing_soon_sent": False,
+        "asian_start_sent": False, "asian_summary_sent": False,
+        "london_start_sent": False, "closing_soon_sent": False,
         "last_status_minute_block": None, "last_offduty_hour": None,
     }
+
+
+def estimate_probability(range_width):
+    if range_width <= NARROW_RANGE_MAX:
+        return ("65-75%", "النطاق ضيق اليوم 📏، هذا النوع تاريخيًا يعطي اصطياد سيولة أنظف وأوضح.")
+    elif range_width <= TYPICAL_RANGE_MAX:
+        return ("45-55%", "النطاق طبيعي اليوم، احتمال متوسط لصفقة واضحة.")
+    else:
+        return ("25-35%", "النطاق واسع اليوم 📐، هذا يزيد احتمال حركة عشوائية بدون اصطياد نظيف.")
 
 
 def find_last_swing(df1m, direction):
@@ -145,7 +164,7 @@ def main():
         print("Weekend — market closed.")
         return
 
-    # --- Off-duty hours: hourly personality check-in, no market work ---
+    # --- Off-duty hours: simple hourly check-in ---
     if hour >= LATE_CUTOFF_H:
         if state.get("last_offduty_hour") != hour:
             hrs_left = hours_until_next_asian(hour)
@@ -155,11 +174,13 @@ def main():
             save_state(state)
         return
 
+    # --- Asian session start ---
     if hour == ASIAN_START_H and not state.get("asian_start_sent"):
-        send_telegram("🌏 بدأت جلسة آسيا! برسم نطاق السعر لين الساعة 6 صباحًا UTC 📐")
+        send_telegram("🌏 بدأنا! جلسة آسيا فتحت، برسم نطاق السعر لين الساعة 6 صباحًا UTC 📐")
         state["asian_start_sent"] = True
         save_state(state)
 
+    # --- London window start ---
     if hour == LONDON_START_H and minute < 15 and not state.get("london_start_sent"):
         ah, al = state.get("asian_high"), state.get("asian_low")
         range_txt = f"النطاق: {al:.2f} - {ah:.2f} 📏" if ah and al else "النطاق لسا ما تحدد ⚠️"
@@ -167,12 +188,14 @@ def main():
         state["london_start_sent"] = True
         save_state(state)
 
+    # --- Closing soon heads-up ---
     if hour == LATE_CUTOFF_H - 1 and minute >= 30 and not state.get("closing_soon_sent"):
         pend = "فيه صفقة معلقة نراقبها 👀" if state.get("pending_signal") else "لين الحين ما فيه شي، الاحتمال يضعف 🤏"
         send_telegram(f"⏰ باقي حوالي 30 دقيقة على إغلاق نافذة الدخول اليوم! {pend}")
         state["closing_soon_sent"] = True
         save_state(state)
 
+    # --- Periodic status during London window ---
     if LONDON_START_H <= hour < LATE_CUTOFF_H:
         minute_block = (hour * 60 + minute) // STATUS_MINUTE_INTERVAL
         if state.get("last_status_minute_block") != minute_block:
@@ -188,6 +211,7 @@ def main():
             state["last_status_minute_block"] = minute_block
             save_state(state)
 
+    # --- Build Asian range, and send probability estimate right when it ends ---
     if ASIAN_START_H <= hour <= ASIAN_END_H:
         df15 = fetch_candles("15min", 60)
         today_asia = df15[(df15["datetime"].dt.date.astype(str) == today_str)
@@ -196,6 +220,19 @@ def main():
         if len(today_asia) > 0:
             state["asian_high"] = float(today_asia["high"].max())
             state["asian_low"] = float(today_asia["low"].min())
+            save_state(state)
+
+        if hour == ASIAN_END_H and not state.get("asian_summary_sent") and state.get("asian_high"):
+            range_width = state["asian_high"] - state["asian_low"]
+            prob, note = estimate_probability(range_width)
+            send_telegram(
+                f"🏁 خلصت جلسة آسيا!\n"
+                f"النطاق: {state['asian_low']:.2f} - {state['asian_high']:.2f} (اتساع ${range_width:.2f})\n"
+                f"📊 تقدير تقريبي لاحتمال صفقة اليوم: {prob}\n"
+                f"{note}\n"
+                "⚠️ هذا تقدير عام مبني على اتساع النطاق بس، مو رقم مبني على اختبار إحصائي دقيق."
+            )
+            state["asian_summary_sent"] = True
             save_state(state)
         return
 
