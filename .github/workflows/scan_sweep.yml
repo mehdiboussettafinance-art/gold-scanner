@@ -6,6 +6,8 @@ on:
     - cron: "*/15 0-6 * * *"
     # Monitor sweep / MSS / FVG / pending entry every 1 minute, 07:00-10:59 UTC
     - cron: "* 7-10 * * *"
+    # Off-duty hourly check-in, 11:00-23:59 UTC (keeps every hour covered)
+    - cron: "0 11-23 * * *"
   workflow_dispatch: {}
 
 permissions:
