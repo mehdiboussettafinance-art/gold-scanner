@@ -190,7 +190,15 @@ def main():
     state = load_state()
     if state.get("date") != today_str:
         state = {"date": today_str, "last_alert_time": state.get("last_alert_time"),
-                  "overlap_start_sent": False, "overlap_end_warned": False}
+                  "overlap_start_sent": False, "overlap_end_warned": False,
+                  "last_status_hour": None}
+
+    hour_key = f"{today_str}-{hour}"
+    if state.get("last_status_hour") == hour_key:
+        print("Already sent the hourly status for this hour (duplicate trigger). Skipping status, still checking signal silently.")
+        already_sent_status_this_hour = True
+    else:
+        already_sent_status_this_hour = False
 
     if hour == OVERLAP_START_H and not state.get("overlap_start_sent"):
         send_telegram("🚀 بدأت نافذة أفضل سيولة اليوم (لندن-نيويورك)! خليني أراقب بتركيز أكبر 👀")
@@ -228,7 +236,10 @@ def main():
     if not (long_signal or short_signal) or already_alerted_this_candle:
         parts.append(random.choice(CLOSERS_IDLE))
 
-    send_telegram("\n".join(parts))
+    if not already_sent_status_this_hour:
+        send_telegram("\n".join(parts))
+        state["last_status_hour"] = hour_key
+        save_state(state)
 
     if already_alerted_this_candle:
         print("Already alerted for this candle.")
@@ -263,3 +274,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
