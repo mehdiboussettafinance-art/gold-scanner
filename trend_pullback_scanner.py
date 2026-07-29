@@ -29,7 +29,6 @@ RSI_HIGH   = 55
 PULLBACK_ATR_MULT = 0.6
 ATR_LEN    = 14
 
-# إدارة المخاطر (من سكريبت Trading View)
 ATR_STOP_MULT = 1.5
 RR1 = 1.0
 RR2 = 2.0
@@ -55,6 +54,21 @@ EMOJI_BUY   = "🟢"
 EMOJI_SELL  = "🔴"
 EMOJI_BLOCK = "⚠️"
 EMOJI_NEWS  = "📰"
+
+
+def init_state_file():
+    """ينشئ ملف الحالة إذا لم يكن موجوداً"""
+    if not os.path.exists(STATE_FILE):
+        initial_state = {
+            "last_alerted_candle": None,
+            "news_date": None,
+            "warned_us_data": False,
+            "warned_fomc": False,
+            "weekly_news_sent": False
+        }
+        with open(STATE_FILE, "w") as f:
+            json.dump(initial_state, f)
+        print("تم إنشاء ملف الحالة الجديد")
 
 
 def in_news_blackout():
@@ -152,28 +166,20 @@ def check_signal(df):
 
 
 def get_important_events_for_week():
-    """يُنتج قائمة بأهم أحداث الأسبوع الحالي (تقديرية بناءً على تواريخ معروفة)"""
     today = datetime.now(ZoneInfo("America/New_York")).date()
-    # أول جمعة من الشهر = NFP (تقريبي)
     first_day = today.replace(day=1)
     first_friday = first_day + timedelta(days=(4 - first_day.weekday() + 7) % 7)
     events = []
-    # FOMC: أربعاء معين، يمكن تقريبه (هذا مثال، لن يكون دقيقًا دائمًا)
-    # نكتفي بالأحداث الشهيرة الثابتة
     monday = today - timedelta(days=today.weekday())
     friday = monday + timedelta(days=4)
-    # NFP
     if monday <= first_friday <= friday:
         events.append(f"تقرير الوظائف غير الزراعية (NFP) – الجمعة {first_friday.strftime('%d/%m')} 08:30 صباحاً بتوقيت نيويورك")
-    # CPI (ثاني أربعاء تقريباً... سنبسط ونترك رسالة عامة)
-    # سنضيف تحذيراً بأن هذه تواريخ تقديرية
     events.append("بيانات التضخم CPI / مبيعات التجزئة – تابع المفكرة الاقتصادية للتأكيد.")
     events.append("أي خطاب لرئيس الفيدرالي أو اجتماع FOMC – يُعلن في الموقع الرسمي.")
     return events
 
 
 def check_weekly_news(state):
-    """يرسل تنبيه أسبوعي صباح الإثنين"""
     now_et = datetime.now(ZoneInfo("America/New_York"))
     if now_et.weekday() == 0 and now_et.hour == 9 and not state.get("weekly_news_sent"):
         events = get_important_events_for_week()
@@ -185,15 +191,12 @@ def check_weekly_news(state):
 
 
 def check_news_warnings(state):
-    """تحذير قبل نافذة الأخبار بساعة"""
     now_et = datetime.now(ZoneInfo("America/New_York"))
     hour_min = now_et.strftime("%H:%M")
-    # بيانات أمريكا تبدأ 08:20 -> نحذر الساعة 07:20
     if hour_min == "07:20" and not state.get("warned_us_data"):
         send_telegram(f"{EMOJI_NEWS} سيبدأ حظر الأخبار (بيانات أمريكية) خلال 60 دقيقة. تجنب الدخول في صفقات جديدة.")
         state["warned_us_data"] = True
         save_state(state)
-    # FOMC تبدأ 13:55 -> نحذر الساعة 12:55
     if hour_min == "12:55" and not state.get("warned_fomc"):
         send_telegram(f"{EMOJI_NEWS} سيبدأ حظر الأخبار (اجتماع الفيدرالي) خلال 60 دقيقة. تجنب الدخول في صفقات جديدة.")
         state["warned_fomc"] = True
@@ -201,6 +204,8 @@ def check_news_warnings(state):
 
 
 def main():
+    init_state_file()
+
     df = fetch_candles("15min", 500)
     if len(df) < 201:
         print("بيانات غير كافية")
@@ -212,25 +217,22 @@ def main():
 
     state = load_state()
 
-    # ---------- 1. مهام الأخبار ----------
     # إعادة تعيين تحذيرات اليوم عند منتصف الليل بتوقيت نيويورك
     today_et_str = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
     if state.get("news_date") != today_et_str:
         state["news_date"] = today_et_str
         state["warned_us_data"] = False
         state["warned_fomc"] = False
-        state["weekly_news_sent"] = False  # نعيده كل إثنين
+        state["weekly_news_sent"] = False
 
     check_weekly_news(state)
     check_news_warnings(state)
 
-    # ---------- 2. تجنب تكرار الإشارات ----------
     last_alerted = state.get("last_alerted_candle")
     if last_alerted == candle_time_str:
         print("الإشارة سبق إرسالها لهذه الشمعة")
         return
 
-    # ---------- 3. حساب الإشارة ووقف الخسارة/الهدف ----------
     longRaw, shortRaw = check_signal(df)
     blackout = in_news_blackout()
     row = df.iloc[-1]
@@ -262,7 +264,6 @@ def main():
                    f"الوقت: {candle_time_str} UTC\n\n"
                    f"🧘 نصيحة: \"{tip}\"")
             send_telegram(msg)
-            state["last_alerted_candle"] = candle_time_str
         else:
             action = "شراء" if direction == "long" else "بيع"
             msg = (f"{EMOJI_BLOCK} إشارة {action} مُنعت بسبب حظر الأخبار\n"
@@ -270,8 +271,8 @@ def main():
                    f"الوقت: {candle_time_str} UTC\n\n"
                    f"🧘 نصيحة: \"{tip}\"")
             send_telegram(msg)
-            state["last_alerted_candle"] = candle_time_str
 
+        state["last_alerted_candle"] = candle_time_str
         save_state(state)
     else:
         print("لا توجد إشارة جديدة")
