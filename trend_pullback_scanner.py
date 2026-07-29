@@ -1,6 +1,6 @@
 """
 XAUUSD Trend-Pullback Scanner PRO — 15min
-مع وقف خسارة وأهداف + نصائح نفسية + تنبيهات أخبار اسبوعية
+مع وقف خسارة وأهداف + نصائح نفسية + تنبيهات أخبار + رسالة تأكيد تشغيل
 """
 
 import os
@@ -33,6 +33,9 @@ ATR_STOP_MULT = 1.5
 RR1 = 1.0
 RR2 = 2.0
 
+# ---------- إعدادات رسالة الحالة ----------
+STATUS_INTERVAL_HOURS = 4   # كل كم ساعة تيجيك رسالة تأكيد التشغيل
+
 # ---------- نصائح نفسية ----------
 PSYCH_TIPS = [
     "تنفس بعمق، لا تدع العواطف تتحكم فيك.",
@@ -54,6 +57,7 @@ EMOJI_BUY   = "🟢"
 EMOJI_SELL  = "🔴"
 EMOJI_BLOCK = "⚠️"
 EMOJI_NEWS  = "📰"
+EMOJI_CHECK = "✅"
 
 
 def init_state_file():
@@ -64,7 +68,8 @@ def init_state_file():
             "news_date": None,
             "warned_us_data": False,
             "warned_fomc": False,
-            "weekly_news_sent": False
+            "weekly_news_sent": False,
+            "last_status_sent": None
         }
         with open(STATE_FILE, "w") as f:
             json.dump(initial_state, f)
@@ -203,6 +208,59 @@ def check_news_warnings(state):
         save_state(state)
 
 
+def send_status_message(state, df):
+    """يرسل رسالة تأكيد تشغيل مع بيانات المؤشرات (كل 4 ساعات مثلاً)"""
+    now_utc = datetime.now(timezone.utc)
+    last_sent = state.get("last_status_sent")
+    if last_sent:
+        last_sent_dt = datetime.fromisoformat(last_sent)
+        if now_utc - last_sent_dt < timedelta(hours=STATUS_INTERVAL_HOURS):
+            return  # ما مرّ وقت كافٍ
+
+    row = df.iloc[-1]
+    price = row["close"]
+    ema20 = row["ema20"]
+    ema50 = row["ema50"]
+    ema200 = row["ema200"]
+    rsi_val = row["rsi"]
+    atr_val = row["atr"]
+    dist_from_ema20 = abs(price - ema20)
+    pullback_limit = atr_val * PULLBACK_ATR_MULT
+
+    # تحديد الاتجاه
+    if price > ema50 and ema50 > ema200:
+        trend = "صاعد 📈"
+    elif price < ema50 and ema50 < ema200:
+        trend = "هابط 📉"
+    else:
+        trend = "محايد ↔️"
+
+    blackout = in_news_blackout()
+    near_zone = dist_from_ema20 <= pullback_limit
+
+    msg = (
+        f"{EMOJI_CHECK} **تأكيد تشغيل البوت – كل الأنظمة تعمل**\n\n"
+        f"💰 السعر الحالي: {price:.2f}\n"
+        f"────────────────────\n"
+        f"🔹 EMA 20: {ema20:.2f}\n"
+        f"🔹 EMA 50: {ema50:.2f}\n"
+        f"🔹 EMA 200: {ema200:.2f}\n"
+        f"🔹 RSI 14: {rsi_val:.1f}\n"
+        f"🔹 ATR 14: {atr_val:.2f}\n"
+        f"────────────────────\n"
+        f"📏 المسافة عن EMA20: {dist_from_ema20:.2f} (الحد المسموح: {pullback_limit:.2f})\n"
+        f"🌊 حالة الاتجاه: {trend}\n"
+        f"🔎 داخل منطقة الارتداد: {'نعم ✅' if near_zone else 'لا ❌'}\n"
+        f"🚫 حظر الأخبار نشط: {'نعم ⚠️' if blackout else 'لا'}\n"
+        f"────────────────────\n"
+        f"⏱️ وقت الشمعة الأخيرة: {row['datetime'].strftime('%Y-%m-%d %H:%M UTC')}\n"
+        f"🔄 سيتم فحص الإشارات حسب الاستراتيجية كل 15 دقيقة."
+    )
+    send_telegram(msg)
+    state["last_status_sent"] = now_utc.isoformat()
+    save_state(state)
+
+
 def main():
     init_state_file()
 
@@ -224,6 +282,9 @@ def main():
         state["warned_us_data"] = False
         state["warned_fomc"] = False
         state["weekly_news_sent"] = False
+
+    # ----- إرسال رسالة تأكيد التشغيل (كل 4 ساعات) -----
+    send_status_message(state, df)
 
     check_weekly_news(state)
     check_news_warnings(state)
