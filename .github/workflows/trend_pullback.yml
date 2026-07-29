@@ -2,7 +2,7 @@ name: Gold Trend-Pullback Scanner PRO
 
 on:
   schedule:
-    # فحص الإشارات كل 15 دقيقة، 24 ساعة (لأن الاستراتيجية تشتغل طول اليوم)
+    # فحص الإشارات كل 15 دقيقة، 24 ساعة
     - cron: "*/15 * * * *"
   workflow_dispatch: {}
 
@@ -23,6 +23,12 @@ jobs:
 
       - name: Install dependencies
         run: pip install -r requirements.txt
+
+      - name: Ensure state file exists
+        run: |
+          if [ ! -f trend_pullback_state.json ]; then
+            echo '{"last_alerted_candle": null}' > trend_pullback_state.json
+          fi
 
       - name: Run Trend-Pullback Scanner
         env:
