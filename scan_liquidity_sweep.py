@@ -1,15 +1,6 @@
 """
-STRATEGY 2 — Asian Range Liquidity Sweep + MSS + FVG (XAUUSD)
-Sends a message exactly when the Asian session starts, an estimated
-probability of getting a trade today right when it ends, session
-start/close heads-up for London, and periodic status updates while
-actively monitoring. Off-duty hours get a light hourly check-in.
-
-LIMITATIONS: "GMT" treated as UTC; spread not verified (OHLC data only);
-swing/MSS detection uses closed 1m candles only. The "probability" below
-is a rough heuristic based on how narrow/wide today's Asian range is —
-NOT a statistically backtested number. Treat it as a general heads-up,
-not a precise forecast.
+XAUUSD Trend-Pullback Scanner PRO — 15min
+مع وقف خسارة وأهداف + نصائح نفسية + تنبيهات أخبار اسبوعية
 """
 
 import os
@@ -20,43 +11,61 @@ import pandas as pd
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
+# ---------- Secrets ----------
 TWELVE_DATA_KEY  = os.environ["TWELVE_DATA_KEY"]
 TELEGRAM_TOKEN   = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
 SYMBOL = "XAU/USD"
-STATE_FILE = "sweep_state.json"
+STATE_FILE = "trend_pullback_state.json"
 
-ASIAN_START_H, ASIAN_END_H = 0, 6
-LONDON_START_H, LONDON_END_H = 7, 10
-LATE_CUTOFF_H = 11
+# ---------- إعدادات الاستراتيجية ----------
+EMA_FAST   = 20
+EMA_TREND  = 50
+EMA_MACRO  = 200
+RSI_LEN    = 14
+RSI_LOW    = 35
+RSI_HIGH   = 55
+PULLBACK_ATR_MULT = 0.6
+ATR_LEN    = 14
 
-MIN_SWEEP_DIST, SL_BUFFER = 0.30, 0.50
-RISK_REWARD, BE_TRIGGER_RR = 3.0, 1.5
-FVG_MAX_MINUTES, ENTRY_EXPIRY_MINUTES = 15, 10
+# إدارة المخاطر (من سكريبت Trading View)
+ATR_STOP_MULT = 1.5
+RR1 = 1.0
+RR2 = 2.0
 
+# ---------- نصائح نفسية ----------
+PSYCH_TIPS = [
+    "تنفس بعمق، لا تدع العواطف تتحكم فيك.",
+    "الثقة في الاستراتيجية أهم من ربح صفقة واحدة.",
+    "التداول ماراثون وليس سباق سريع.",
+    "الخسارة جزء من اللعبة، تقبلها وتعلم منها.",
+    "التزم بخطتك، فأنت من وضعها في وقت هدوءك.",
+    "لا تطارد السعر، السوق سيعطيك فرصة أخرى.",
+    "ركز على العملية وليس المكسب.",
+    "الشاشة ليست قدرك، ابتعد قليلاً إذا توترت."
+]
+
+# ---------- فترات حظر الأخبار (بتوقيت نيويورك) ----------
 US_DATA_WINDOW = ("08:20", "09:10")
 FOMC_WINDOW    = ("13:55", "14:50")
 
-STATUS_MINUTE_INTERVAL = 30
-
-# Range-width heuristic thresholds (USD) for the probability estimate
-NARROW_RANGE_MAX = 3.0
-TYPICAL_RANGE_MAX = 6.0
-
-OFFDUTY_LINES = [
-    "😴 برا أوقات شغلي الحين (آسيا 00:00-06:00 أو لندن 07:00-11:00 UTC)، خذ راحتك.",
-    "🌙 مافيه شي أراقبه هالوقت، بس تابعني، رح أرجع نشيط بالوقت المحدد.",
-    "☕ استراحة! سوق الذهب برا نافذتي حاليًا، بشتغل بجد قريب.",
-    "🛌 هذا وقت راحتي بالجدول، بس ما نسيتك، بحدثك أول ما أرجع أشتغل.",
-]
-
-FUN_EMOJIS = ["🕵️", "🔎", "🧭", "🛰️", "📡", "🌊"]
-GREEN_EMOJIS = ["🟢", "✅", "🚀"]
+# ---------- رموز إشارات ----------
+EMOJI_BUY   = "🟢"
+EMOJI_SELL  = "🔴"
+EMOJI_BLOCK = "⚠️"
+EMOJI_NEWS  = "📰"
 
 
-def hours_until_next_asian(hour):
-    return 24 - hour if hour >= ASIAN_START_H else ASIAN_START_H - hour
+def in_news_blackout():
+    now_et = datetime.now(ZoneInfo("America/New_York"))
+    hm = now_et.strftime("%H:%M")
+    return US_DATA_WINDOW[0] <= hm <= US_DATA_WINDOW[1] or FOMC_WINDOW[0] <= hm <= FOMC_WINDOW[1]
+
+
+def send_telegram(message):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": message}, timeout=15)
 
 
 def fetch_candles(interval, outputsize):
@@ -74,18 +83,6 @@ def fetch_candles(interval, outputsize):
     return df.sort_values("datetime").reset_index(drop=True)
 
 
-def in_news_blackout():
-    now_et = datetime.now(ZoneInfo("America/New_York"))
-    hm = now_et.strftime("%H:%M")
-    return US_DATA_WINDOW[0] <= hm <= US_DATA_WINDOW[1] or FOMC_WINDOW[0] <= hm <= FOMC_WINDOW[1]
-
-
-def send_telegram(message):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    full_msg = "[STRATEGY 2 - Liquidity Sweep] " + random.choice(FUN_EMOJIS) + "\n" + message
-    requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": full_msg}, timeout=15)
-
-
 def load_state():
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE) as f:
@@ -98,226 +95,186 @@ def save_state(state):
         json.dump(state, f, default=str)
 
 
-def fresh_daily_state(today_str):
-    return {
-        "date": today_str, "asian_high": None, "asian_low": None, "sweep": None,
-        "pending_signal": None, "trade_taken_today": False,
-        "asian_start_sent": False, "asian_summary_sent": False,
-        "london_start_sent": False, "closing_soon_sent": False,
-        "last_status_minute_block": None, "last_offduty_hour": None,
-    }
+def compute_indicators(df):
+    close = df["close"]
+    df["ema20"]  = close.ewm(span=EMA_FAST, adjust=False).mean()
+    df["ema50"]  = close.ewm(span=EMA_TREND, adjust=False).mean()
+    df["ema200"] = close.ewm(span=EMA_MACRO, adjust=False).mean()
+
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1/RSI_LEN, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1/RSI_LEN, adjust=False).mean()
+    rs = avg_gain / avg_loss
+    df["rsi"] = 100 - (100 / (1 + rs))
+
+    high, low = df["high"], df["low"]
+    prev_close = close.shift(1)
+    tr1 = high - low
+    tr2 = abs(high - prev_close)
+    tr3 = abs(low - prev_close)
+    true_range = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    df["atr"] = true_range.ewm(alpha=1/ATR_LEN, adjust=False).mean()
+    return df
 
 
-def estimate_probability(range_width):
-    if range_width <= NARROW_RANGE_MAX:
-        return ("65-75%", "النطاق ضيق اليوم 📏، هذا النوع تاريخيًا يعطي اصطياد سيولة أنظف وأوضح.")
-    elif range_width <= TYPICAL_RANGE_MAX:
-        return ("45-55%", "النطاق طبيعي اليوم، احتمال متوسط لصفقة واضحة.")
-    else:
-        return ("25-35%", "النطاق واسع اليوم 📐، هذا يزيد احتمال حركة عشوائية بدون اصطياد نظيف.")
+def check_signal(df):
+    row = df.iloc[-1]
+    prev = df.iloc[-2]
+
+    uptrend   = row["close"] > row["ema50"] and row["ema50"] > row["ema200"]
+    downtrend = row["close"] < row["ema50"] and row["ema50"] < row["ema200"]
+
+    dist = abs(row["close"] - row["ema20"])
+    near_pullback = dist <= (row["atr"] * PULLBACK_ATR_MULT)
+
+    rsi_long_zone  = RSI_LOW <= row["rsi"] <= RSI_HIGH and row["rsi"] > prev["rsi"]
+    rsi_short_zone = (100 - RSI_HIGH) <= row["rsi"] <= (100 - RSI_LOW) and row["rsi"] < prev["rsi"]
+
+    bodySize = abs(row["close"] - row["open"])
+    lowerWick = min(row["open"], row["close"]) - row["low"]
+    upperWick = row["high"] - max(row["open"], row["close"])
+
+    bullishPin    = lowerWick >= bodySize * 1.5 and row["close"] > row["open"]
+    bullishEngulf = (row["close"] > row["open"] and row["open"] <= prev["close"]
+                     and row["close"] >= prev["open"] and prev["close"] < prev["open"])
+    bullishReject = bullishPin or bullishEngulf
+
+    bearishPin    = upperWick >= bodySize * 1.5 and row["close"] < row["open"]
+    bearishEngulf = (row["close"] < row["open"] and row["open"] >= prev["close"]
+                     and row["close"] <= prev["open"] and prev["close"] > prev["open"])
+    bearishReject = bearishPin or bearishEngulf
+
+    longRaw  = uptrend and near_pullback and rsi_long_zone and bullishReject
+    shortRaw = downtrend and near_pullback and rsi_short_zone and bearishReject
+    return longRaw, shortRaw
 
 
-def find_last_swing(df1m, direction):
-    n = len(df1m)
-    for i in range(n - 3, 1, -1):
-        if direction == "high":
-            if (df1m["high"][i] > df1m["high"][i - 1] and df1m["high"][i] > df1m["high"][i - 2]
-                    and df1m["high"][i] > df1m["high"][i + 1] and df1m["high"][i] > df1m["high"][i + 2]):
-                return df1m["high"][i]
-        else:
-            if (df1m["low"][i] < df1m["low"][i - 1] and df1m["low"][i] < df1m["low"][i - 2]
-                    and df1m["low"][i] < df1m["low"][i + 1] and df1m["low"][i] < df1m["low"][i + 2]):
-                return df1m["low"][i]
-    return None
+def get_important_events_for_week():
+    """يُنتج قائمة بأهم أحداث الأسبوع الحالي (تقديرية بناءً على تواريخ معروفة)"""
+    today = datetime.now(ZoneInfo("America/New_York")).date()
+    # أول جمعة من الشهر = NFP (تقريبي)
+    first_day = today.replace(day=1)
+    first_friday = first_day + timedelta(days=(4 - first_day.weekday() + 7) % 7)
+    events = []
+    # FOMC: أربعاء معين، يمكن تقريبه (هذا مثال، لن يكون دقيقًا دائمًا)
+    # نكتفي بالأحداث الشهيرة الثابتة
+    monday = today - timedelta(days=today.weekday())
+    friday = monday + timedelta(days=4)
+    # NFP
+    if monday <= first_friday <= friday:
+        events.append(f"تقرير الوظائف غير الزراعية (NFP) – الجمعة {first_friday.strftime('%d/%m')} 08:30 صباحاً بتوقيت نيويورك")
+    # CPI (ثاني أربعاء تقريباً... سنبسط ونترك رسالة عامة)
+    # سنضيف تحذيراً بأن هذه تواريخ تقديرية
+    events.append("بيانات التضخم CPI / مبيعات التجزئة – تابع المفكرة الاقتصادية للتأكيد.")
+    events.append("أي خطاب لرئيس الفيدرالي أو اجتماع FOMC – يُعلن في الموقع الرسمي.")
+    return events
 
 
-def check_mss_and_fvg(df1m, sweep_type):
-    if len(df1m) < 6:
-        return False, None
-    last = df1m.iloc[-1]
-    if sweep_type == "sell":
-        sw = find_last_swing(df1m.iloc[:-1].reset_index(drop=True), "low")
-        if sw is None or last["close"] >= sw:
-            return False, None
-        c1, c3 = df1m.iloc[-3], df1m.iloc[-1]
-        return (True, c1["low"]) if c1["low"] > c3["high"] else (False, None)
-    else:
-        sw = find_last_swing(df1m.iloc[:-1].reset_index(drop=True), "high")
-        if sw is None or last["close"] <= sw:
-            return False, None
-        c1, c3 = df1m.iloc[-3], df1m.iloc[-1]
-        return (True, c1["high"]) if c1["high"] < c3["low"] else (False, None)
+def check_weekly_news(state):
+    """يرسل تنبيه أسبوعي صباح الإثنين"""
+    now_et = datetime.now(ZoneInfo("America/New_York"))
+    if now_et.weekday() == 0 and now_et.hour == 9 and not state.get("weekly_news_sent"):
+        events = get_important_events_for_week()
+        msg = f"{EMOJI_NEWS} أهم أخبار الأسبوع التي قد تؤثر على الذهب:\n" + "\n".join(f"• {e}" for e in events)
+        msg += "\n\n⚠️ هذه تواريخ تقديرية، يُنصح بمراجعة مفكرة اقتصادية موثوقة."
+        send_telegram(msg)
+        state["weekly_news_sent"] = True
+        save_state(state)
+
+
+def check_news_warnings(state):
+    """تحذير قبل نافذة الأخبار بساعة"""
+    now_et = datetime.now(ZoneInfo("America/New_York"))
+    hour_min = now_et.strftime("%H:%M")
+    # بيانات أمريكا تبدأ 08:20 -> نحذر الساعة 07:20
+    if hour_min == "07:20" and not state.get("warned_us_data"):
+        send_telegram(f"{EMOJI_NEWS} سيبدأ حظر الأخبار (بيانات أمريكية) خلال 60 دقيقة. تجنب الدخول في صفقات جديدة.")
+        state["warned_us_data"] = True
+        save_state(state)
+    # FOMC تبدأ 13:55 -> نحذر الساعة 12:55
+    if hour_min == "12:55" and not state.get("warned_fomc"):
+        send_telegram(f"{EMOJI_NEWS} سيبدأ حظر الأخبار (اجتماع الفيدرالي) خلال 60 دقيقة. تجنب الدخول في صفقات جديدة.")
+        state["warned_fomc"] = True
+        save_state(state)
 
 
 def main():
-    now_utc = datetime.now(timezone.utc)
-    today_str = now_utc.strftime("%Y-%m-%d")
-    weekday = now_utc.weekday()
-    hour, minute = now_utc.hour, now_utc.minute
+    df = fetch_candles("15min", 500)
+    if len(df) < 201:
+        print("بيانات غير كافية")
+        return
+
+    df = compute_indicators(df)
+    last_candle_time = df.iloc[-1]["datetime"]
+    candle_time_str = last_candle_time.strftime("%Y-%m-%d %H:%M")
 
     state = load_state()
-    if state.get("date") != today_str:
-        state = fresh_daily_state(today_str)
-        save_state(state)
 
-    if weekday >= 5:
-        print("Weekend — market closed.")
+    # ---------- 1. مهام الأخبار ----------
+    # إعادة تعيين تحذيرات اليوم عند منتصف الليل بتوقيت نيويورك
+    today_et_str = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
+    if state.get("news_date") != today_et_str:
+        state["news_date"] = today_et_str
+        state["warned_us_data"] = False
+        state["warned_fomc"] = False
+        state["weekly_news_sent"] = False  # نعيده كل إثنين
+
+    check_weekly_news(state)
+    check_news_warnings(state)
+
+    # ---------- 2. تجنب تكرار الإشارات ----------
+    last_alerted = state.get("last_alerted_candle")
+    if last_alerted == candle_time_str:
+        print("الإشارة سبق إرسالها لهذه الشمعة")
         return
 
-    # --- Off-duty hours: simple hourly check-in ---
-    if hour >= LATE_CUTOFF_H:
-        if state.get("last_offduty_hour") != hour:
-            hrs_left = hours_until_next_asian(hour)
-            recap = "✅ أخذنا صفقة اليوم" if state.get("trade_taken_today") else "🤷 ما صارت صفقة اليوم"
-            send_telegram(f"{random.choice(OFFDUTY_LINES)}\n{recap}. أرجع أشتغل خلال {hrs_left} ساعة تقريبًا ⏰")
-            state["last_offduty_hour"] = hour
-            save_state(state)
-        return
+    # ---------- 3. حساب الإشارة ووقف الخسارة/الهدف ----------
+    longRaw, shortRaw = check_signal(df)
+    blackout = in_news_blackout()
+    row = df.iloc[-1]
+    price = row["close"]
+    atr_val = row["atr"]
 
-    # --- Asian session start ---
-    if hour == ASIAN_START_H and not state.get("asian_start_sent"):
-        send_telegram("🌏 بدأنا! جلسة آسيا فتحت، برسم نطاق السعر لين الساعة 6 صباحًا UTC 📐")
-        state["asian_start_sent"] = True
-        save_state(state)
-
-    # --- London window start ---
-    if hour == LONDON_START_H and minute < 15 and not state.get("london_start_sent"):
-        ah, al = state.get("asian_high"), state.get("asian_low")
-        range_txt = f"النطاق: {al:.2f} - {ah:.2f} 📏" if ah and al else "النطاق لسا ما تحدد ⚠️"
-        send_telegram(f"🇬🇧🔥 بدأت نافذة لندن! ندور على اصطياد سيولة\n{range_txt}\nبنراقب كل دقيقة 🕵️")
-        state["london_start_sent"] = True
-        save_state(state)
-
-    # --- Closing soon heads-up ---
-    if hour == LATE_CUTOFF_H - 1 and minute >= 30 and not state.get("closing_soon_sent"):
-        pend = "فيه صفقة معلقة نراقبها 👀" if state.get("pending_signal") else "لين الحين ما فيه شي، الاحتمال يضعف 🤏"
-        send_telegram(f"⏰ باقي حوالي 30 دقيقة على إغلاق نافذة الدخول اليوم! {pend}")
-        state["closing_soon_sent"] = True
-        save_state(state)
-
-    # --- Periodic status during London window ---
-    if LONDON_START_H <= hour < LATE_CUTOFF_H:
-        minute_block = (hour * 60 + minute) // STATUS_MINUTE_INTERVAL
-        if state.get("last_status_minute_block") != minute_block:
-            if state.get("pending_signal") and state["pending_signal"]["status"] == "pending":
-                status_txt = f"🎯 فيه أمر معلق عند {state['pending_signal']['entry']:.2f}، نراقب لو يتلمس"
-            elif state.get("sweep"):
-                status_txt = f"🌊 صار اصطياد سيولة ({state['sweep']['type']})، نستنى تأكيد MSS+FVG"
-            elif state.get("trade_taken_today"):
-                status_txt = "✅ خلصنا صفقة اليوم، بنستريح لين بكرة"
-            else:
-                status_txt = f"{random.choice(FUN_EMOJIS)} لسا نراقب النطاق، ما فيه اصطياد واضح لين الحين"
-            send_telegram(f"📡 تحديث دوري: {status_txt}")
-            state["last_status_minute_block"] = minute_block
-            save_state(state)
-
-    # --- Build Asian range, and send probability estimate right when it ends ---
-    if ASIAN_START_H <= hour <= ASIAN_END_H:
-        df15 = fetch_candles("15min", 60)
-        today_asia = df15[(df15["datetime"].dt.date.astype(str) == today_str)
-                           & (df15["datetime"].dt.hour >= ASIAN_START_H)
-                           & (df15["datetime"].dt.hour < ASIAN_END_H)]
-        if len(today_asia) > 0:
-            state["asian_high"] = float(today_asia["high"].max())
-            state["asian_low"] = float(today_asia["low"].min())
-            save_state(state)
-
-        if hour == ASIAN_END_H and not state.get("asian_summary_sent") and state.get("asian_high"):
-            range_width = state["asian_high"] - state["asian_low"]
-            prob, note = estimate_probability(range_width)
-            send_telegram(
-                f"🏁 خلصت جلسة آسيا!\n"
-                f"النطاق: {state['asian_low']:.2f} - {state['asian_high']:.2f} (اتساع ${range_width:.2f})\n"
-                f"📊 تقدير تقريبي لاحتمال صفقة اليوم: {prob}\n"
-                f"{note}\n"
-                "⚠️ هذا تقدير عام مبني على اتساع النطاق بس، مو رقم مبني على اختبار إحصائي دقيق."
-            )
-            state["asian_summary_sent"] = True
-            save_state(state)
-        return
-
-    if hour < LONDON_START_H:
-        print("Before London window.")
-        return
-
-    if state.get("trade_taken_today"):
-        print("Trade already taken today.")
-        return
-
-    if state.get("asian_high") is None:
-        print("Asian range not available yet.")
-        return
-
-    pending = state.get("pending_signal")
-    if pending and pending.get("status") == "pending":
-        expires = datetime.fromisoformat(pending["expires"])
-        df1m = fetch_candles("1min", 15)
-        touched = ((pending["direction"] == "sell" and df1m["high"].max() >= pending["entry"])
-                   or (pending["direction"] == "buy" and df1m["low"].min() <= pending["entry"]))
-        if touched:
-            pending["status"] = "filled"
-            state["trade_taken_today"] = True
-            save_state(state)
-            send_telegram(f"{random.choice(GREEN_EMOJIS)} ENTRY TRIGGERED — {pending['direction'].upper()} 🎉\n"
-                          f"Entry: {pending['entry']:.2f}\nStop Loss: {pending['sl']:.2f} 🛑\n"
-                          f"Take Profit: {pending['tp']:.2f} 🎯\n"
-                          f"حرك الوقف للتعادل عند 1:{BE_TRIGGER_RR} 🔒\nتأكد من السبريد الفعلي قبل التنفيذ ⚠️")
-            return
-        if now_utc >= expires:
-            pending["status"] = "expired"
-            state["pending_signal"] = pending
-            save_state(state)
-            send_telegram(f"⌛ انتهت صلاحية الأمر بدون تنفيذ ({pending['direction'].upper()} @ {pending['entry']:.2f}) 🤷")
-            return
-        print("Pending signal still active.")
-        return
-
-    sweep = state.get("sweep")
-    if not sweep:
-        df15 = fetch_candles("15min", 10)
-        last15 = df15.iloc[-1]
-        if last15["high"] >= state["asian_high"] + MIN_SWEEP_DIST:
-            sweep = {"type": "sell", "time": now_utc.isoformat(), "extreme": float(last15["high"])}
-        elif last15["low"] <= state["asian_low"] - MIN_SWEEP_DIST:
-            sweep = {"type": "buy", "time": now_utc.isoformat(), "extreme": float(last15["low"])}
-        if sweep:
-            state["sweep"] = sweep
-            save_state(state)
-            send_telegram(f"🌊🚨 اصطياد سيولة! احتمال إعداد {sweep['type'].upper()} يتكوّن\n"
-                          f"نراقب MSS + FVG خلال {FVG_MAX_MINUTES} دقيقة القادمة ⏱️")
-        return
-
-    sweep_time = datetime.fromisoformat(sweep["time"])
-    if now_utc - sweep_time > timedelta(minutes=FVG_MAX_MINUTES):
-        state["sweep"] = None
-        save_state(state)
-        return
-
-    if in_news_blackout():
-        print("News blackout, holding off.")
-        return
-
-    df1m = fetch_candles("1min", 15)
-    found, entry = check_mss_and_fvg(df1m, sweep["type"])
-    if found:
-        if sweep["type"] == "sell":
-            sl = sweep["extreme"] + SL_BUFFER
-            risk = sl - entry
-            tp = entry - risk * RISK_REWARD
+    if longRaw or shortRaw:
+        direction = "long" if longRaw else "short"
+        if direction == "long":
+            sl = price - atr_val * ATR_STOP_MULT
+            tp1 = price + (atr_val * ATR_STOP_MULT) * RR1
+            tp2 = price + (atr_val * ATR_STOP_MULT) * RR2
         else:
-            sl = sweep["extreme"] - SL_BUFFER
-            risk = entry - sl
-            tp = entry + risk * RISK_REWARD
-        pending_signal = {"direction": sweep["type"], "entry": float(entry), "sl": float(sl), "tp": float(tp),
-                           "created": now_utc.isoformat(),
-                           "expires": (now_utc + timedelta(minutes=ENTRY_EXPIRY_MINUTES)).isoformat(),
-                           "status": "pending"}
-        state["pending_signal"] = pending_signal
+            sl = price + atr_val * ATR_STOP_MULT
+            tp1 = price - (atr_val * ATR_STOP_MULT) * RR1
+            tp2 = price - (atr_val * ATR_STOP_MULT) * RR2
+
+        tip = random.choice(PSYCH_TIPS)
+
+        if not blackout:
+            emoji = EMOJI_BUY if direction == "long" else EMOJI_SELL
+            action = "شراء" if direction == "long" else "بيع"
+            msg = (f"[TREND-PULLBACK] 📈\n"
+                   f"{emoji} {action} XAUUSD على فريم 15 دقيقة\n"
+                   f"السعر الآن: {price:.2f}\n"
+                   f"وقف الخسارة: {sl:.2f} 🛑\n"
+                   f"الهدف 1 (1:{RR1:.1f}): {tp1:.2f} 🎯\n"
+                   f"الهدف 2 (1:{RR2:.1f}): {tp2:.2f} 🚀\n"
+                   f"الوقت: {candle_time_str} UTC\n\n"
+                   f"🧘 نصيحة: \"{tip}\"")
+            send_telegram(msg)
+            state["last_alerted_candle"] = candle_time_str
+        else:
+            action = "شراء" if direction == "long" else "بيع"
+            msg = (f"{EMOJI_BLOCK} إشارة {action} مُنعت بسبب حظر الأخبار\n"
+                   f"السعر: {price:.2f}\n"
+                   f"الوقت: {candle_time_str} UTC\n\n"
+                   f"🧘 نصيحة: \"{tip}\"")
+            send_telegram(msg)
+            state["last_alerted_candle"] = candle_time_str
+
         save_state(state)
-        send_telegram(f"{random.choice(GREEN_EMOJIS)} MSS + FVG CONFIRMED — {sweep['type'].upper()} جاهز 🔥\n"
-                      f"Pending Limit Entry: {entry:.2f}\nStop Loss: {sl:.2f} 🛑\n"
-                      f"Take Profit (1:{RISK_REWARD:g}): {tp:.2f} 🎯\n"
-                      f"ينتهي لو ما انلمس خلال {ENTRY_EXPIRY_MINUTES} دقايق ⏳\nتأكد من السبريد يدويًا ⚠️")
+    else:
+        print("لا توجد إشارة جديدة")
 
 
 if __name__ == "__main__":
