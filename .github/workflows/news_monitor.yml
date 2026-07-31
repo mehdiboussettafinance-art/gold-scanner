@@ -1,0 +1,39 @@
+name: News Monitor (FMP Only)
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"   # كل 15 دقيقة، ما يلمس Twelve Data إطلاقًا
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run news monitor
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
+        run: python news_monitor.py
+
+      - name: Save state back to repo
+        run: |
+          git config user.name "gold-scanner-bot"
+          git config user.email "actions@github.com"
+          git add news_state.json || true
+          git diff --quiet && git diff --staged --quiet || git commit -m "Update news monitor state"
+          git push || true
