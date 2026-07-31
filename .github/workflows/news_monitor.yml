@@ -2,7 +2,7 @@ name: News Monitor (FMP Only)
 
 on:
   schedule:
-    - cron: "*/15 * * * *"   # كل 15 دقيقة، ما يلمس Twelve Data إطلاقًا
+    - cron: "7,22,37,52 * * * *"   # احتياطي GitHub، بفارق 7 دقايق عن cron-job.org
   workflow_dispatch: {}
 
 permissions:
