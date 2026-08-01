@@ -1,79 +1,81 @@
-
 """
-XAUUSD Trading Bot - إصدار محدّث
-- شراء / بيع مع الاتجاه وعكسه تصحيحياً
-- ملاحظة: تنبيهات الأخبار الحين بملف منفصل (news_monitor.py) يشتغل أكثر تكرارًا
-  بدون ما يستهلك حصة Twelve Data
+XAUUSD Trend-Pullback Scanner — Strategy 1 (v2: higher frequency)
+Changes from v1:
+- Trend bias computed on H4 (unchanged, strict filter)
+- Entry conditions now checked on H1 candles (was H4) -> checked every hour
+  instead of every 4 hours = up to 4x more opportunities
+- RSI pullback zone widened from 40-50 to 35-55
+- Added a second entry pattern: range-compression breakout in the direction
+  of the H4 trend, as an alternative to the classic pullback
+Still talks to you every single hour.
 """
 
 import os
 import json
+import random
 import requests
 import pandas as pd
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
-# ---------- مفاتيح البيئة ----------
-TWELVE_DATA_KEY = os.environ["TWELVE_DATA_KEY"]
-TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+TWELVE_DATA_KEY   = os.environ["TWELVE_DATA_KEY"]
+TELEGRAM_TOKEN    = os.environ["TELEGRAM_BOT_TOKEN"]
+TELEGRAM_CHAT_ID  = os.environ["TELEGRAM_CHAT_ID"]
 
 SYMBOL = "XAU/USD"
 STATE_FILE = "state.json"
 
-# ---------- إعدادات الإطارات ----------
-MACRO_INTERVAL, MACRO_OUTPUTSIZE = "4h", 300
-TREND_INTERVAL, TREND_OUTPUTSIZE = "1h", 300
-ENTRY_INTERVAL, ENTRY_OUTPUTSIZE = "15min", 500
-SWING_LOOKBACK = 20
+TREND_INTERVAL, TREND_OUTPUTSIZE = "4h", 300
+ENTRY_INTERVAL, ENTRY_OUTPUTSIZE = "1h", 300
 
-EMA_MACRO = 200
-EMA_TREND_H1 = 50
-EMA_MACRO_H1 = 200
-EMA_FAST = 20
-EMA_MID = 50
-RSI_LEN = 14
-ATR_LEN = 14
-
-PULLBACK_ATR_MULT = 1.2
-REJECTION_WICK_RATIO = 1.2
-RSI_BUY_LOW, RSI_BUY_HIGH = 35, 55
-RSI_SELL_LOW, RSI_SELL_HIGH = 45, 65
-ATR_STOP_MULT = 1.5
+EMA_TREND, EMA_MACRO = 50, 200      # computed on H4 (trend bias)
+EMA_FAST = 20                        # computed on H1 (pullback zone)
+RSI_LEN, RSI_LOW, RSI_HIGH = 14, 35, 55   # widened zone
+ATR_LEN, PULLBACK_ATR_MULT, ATR_STOP_MULT = 14, 0.6, 1.5
 RR1, RR2 = 1.0, 2.0
-MAX_SIGNALS_PER_DAY = 2
 
-# نافذة الحظر حول أي خبر عالي التأثير (دقائق قبل/بعد وقته الفعلي)
-NEWS_BLACKOUT_BEFORE_MIN = 30
-NEWS_BLACKOUT_AFTER_MIN = 30
-NEWS_STATE_FILE = "news_state.json"  # يكتبه news_monitor.py، هذا الملف يقرأه بس
+CONSOLIDATION_LOOKBACK = 10
+CONSOLIDATION_ATR_RATIO = 0.7   # current ATR must be below 70% of its 20-period average to count as "tight"
+
+US_DATA_WINDOW = ("08:20", "09:10")
+FOMC_WINDOW    = ("13:55", "14:50")
+OVERLAP_START_H, OVERLAP_END_H = 13, 16
+
+OPENERS = [
+    "👋 أنا لسا هنا، خلني أحدثك عن آخر وضع.",
+    "🕓 مرت ساعة، وهذا اللي شفته بالسوق.",
+    "📌 تحديث سريع قبل لا تسأل وش صاير.",
+    "🧠 خلاصة اللي راقبته للتو:",
+    "🔔 ما نسيتك، هذا آخر شي عندي.",
+    "📋 تقرير الساعة جاهز:",
+]
+TREND_TALK = {
+    "uptrend": ["الاتجاه العام (H4) لسا صاعد بقوة 📈", "الترند صاعد وواضح 🟢 على H4", "الذهب متمسك بالصعود 📈 على الفريم الكبير"],
+    "downtrend": ["الاتجاه هابط بوضوح 📉 على H4", "الترند نازل 🔴 على الفريم الكبير", "السوق مستمر بالهبوط 📉 على H4"],
+    "ranging": ["الوضع متذبذب على H4 حاليًا 🌊", "السوق عرضي هالفترة على الفريم الكبير 😐", "حركة جانبية على H4 بدون قرار 🤏"],
+}
+CLOSERS_IDLE = [
+    "😴 بس هذا وضعنا الحين، ولا فيه إشارة جاهزة على H1.",
+    "🤷 لسا نراقب H1، ما توفرت كل الشروط سوا.",
+    "⏳ صبر شوي، أفحص H1 كل ساعة، أول فرصة أخبرك.",
+    "🔍 نكمل المراقبة على الفريم الأصغر، صبرك يستاهل.",
+]
+BLACKOUT_ON  = ["🔇 فيه حظر أخبار شغال حاليًا، حتى لو صارت إشارة بنؤجلها."]
+BLACKOUT_OFF = ["🔊 ما فيه حظر أخبار حاليًا، الطريق مفتوح لو صارت إشارة."]
 
 
-def in_news_blackout_now():
-    """
-    يتحقق من الحظر بقراءة نفس الملف اللي يحدّثه news_monitor.py،
-    بدون ما يسوي أي طلب لـ FMP بنفسه (يوفر الحصة المجانية).
-    """
-    if not os.path.exists(NEWS_STATE_FILE):
-        return False, None
-    try:
-        with open(NEWS_STATE_FILE) as f:
-            news_state = json.load(f)
-    except Exception:
-        return False, None
-
-    now_utc = datetime.now(timezone.utc)
-    for e in news_state.get("todays_events", []):
-        event_time = datetime.fromisoformat(e["time_utc"])
-        window_start = event_time - timedelta(minutes=NEWS_BLACKOUT_BEFORE_MIN)
-        window_end = event_time + timedelta(minutes=NEWS_BLACKOUT_AFTER_MIN)
-        if window_start <= now_utc <= window_end:
-            return True, e["event"]
-    return False, None
+def rsi_note(rsi_val, direction_hint):
+    if direction_hint == "uptrend":
+        if RSI_LOW <= rsi_val <= RSI_HIGH:
+            return "بمنطقة الشراء المقبولة 👍"
+        return "برا منطقتنا المفضلة حاليًا."
+    elif direction_hint == "downtrend":
+        if (100 - RSI_HIGH) <= rsi_val <= (100 - RSI_LOW):
+            return "بمنطقة البيع المقبولة 👍"
+        return "برا منطقتنا المفضلة حاليًا."
+    return "السوق عرضي، RSI ما يعطي إشارة قوية."
 
 
-# ============================================================
-# البيانات والمؤشرات
-# ============================================================
 def fetch_candles(interval, outputsize):
     url = "https://api.twelvedata.com/time_series"
     params = {"symbol": SYMBOL, "interval": interval, "outputsize": outputsize,
@@ -105,23 +107,14 @@ def add_rsi_atr(df):
     lc = (df["low"] - df["close"].shift()).abs()
     tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
     df["atr"] = tr.ewm(alpha=1 / ATR_LEN, adjust=False).mean()
+    df["atr_avg20"] = df["atr"].rolling(20).mean()
     return df
 
 
-def get_macro_filter(df4h):
+def get_trend_bias(df4h):
+    df4h = add_ema(df4h, EMA_TREND, "ema_trend")
     df4h = add_ema(df4h, EMA_MACRO, "ema_macro")
     last = df4h.iloc[-1]
-    if last["close"] > last["ema_macro"]:
-        return "uptrend"
-    elif last["close"] < last["ema_macro"]:
-        return "downtrend"
-    return "neutral"
-
-
-def get_trend_bias_h1(df1h):
-    df1h = add_ema(df1h, EMA_TREND_H1, "ema_trend")
-    df1h = add_ema(df1h, EMA_MACRO_H1, "ema_macro")
-    last = df1h.iloc[-1]
     if last["close"] > last["ema_trend"] > last["ema_macro"]:
         return "uptrend"
     if last["close"] < last["ema_trend"] < last["ema_macro"]:
@@ -129,79 +122,53 @@ def get_trend_bias_h1(df1h):
     return "ranging"
 
 
-def find_swing_high_low(df, lookback=SWING_LOOKBACK):
-    if len(df) < lookback:
-        return None, None
-    recent = df.iloc[-lookback:-1]
-    return recent["high"].max(), recent["low"].min()
+def check_entry(df1h, bias):
+    df1h = add_ema(df1h, EMA_FAST, "ema_fast")
+    df1h = add_rsi_atr(df1h)
+    last, prev = df1h.iloc[-1], df1h.iloc[-2]
 
-
-def check_entry(df, bias, macro_filter):
-    if len(df) < 30:
-        return False, False, None, None, None
-
-    df = add_ema(df, EMA_FAST, "ema_fast")
-    df = add_ema(df, EMA_MID, "ema_mid")
-    df = add_rsi_atr(df)
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
-
-    swing_high, swing_low = find_swing_high_low(df)
-    if swing_high is None or swing_low is None:
-        return False, False, None, None, None
-
+    # --- Pattern A: classic pullback + rejection candle ---
+    dist = abs(last["close"] - last["ema_fast"])
+    near_pullback = dist <= (last["atr"] * PULLBACK_ATR_MULT)
+    rsi_long_zone = (RSI_LOW <= last["rsi"] <= RSI_HIGH) and (last["rsi"] > prev["rsi"])
+    rsi_short_zone = ((100 - RSI_HIGH) <= last["rsi"] <= (100 - RSI_LOW)) and (last["rsi"] < prev["rsi"])
     body = abs(last["close"] - last["open"])
     lw = min(last["open"], last["close"]) - last["low"]
     uw = last["high"] - max(last["open"], last["close"])
-    bullish_reject = (last["close"] > last["open"]) and (lw >= body * REJECTION_WICK_RATIO)
-    bearish_reject = (last["close"] < last["open"]) and (uw >= body * REJECTION_WICK_RATIO)
+    bullish_reject = (lw >= body * 1.5 and last["close"] > last["open"]) or \
+                      (last["close"] > last["open"] and last["open"] <= prev["close"] and last["close"] >= prev["open"] and prev["close"] < prev["open"])
+    bearish_reject = (uw >= body * 1.5 and last["close"] < last["open"]) or \
+                      (last["close"] < last["open"] and last["open"] >= prev["close"] and last["close"] <= prev["open"] and prev["close"] > prev["open"])
 
-    near_ema = abs(last["close"] - last["ema_fast"]) <= (last["atr"] * PULLBACK_ATR_MULT)
-    rsi_buy_ok = RSI_BUY_LOW <= last["rsi"] <= RSI_BUY_HIGH
-    rsi_sell_ok = RSI_SELL_LOW <= last["rsi"] <= RSI_SELL_HIGH
+    pullback_long = bias == "uptrend" and near_pullback and rsi_long_zone and bullish_reject
+    pullback_short = bias == "downtrend" and near_pullback and rsi_short_zone and bearish_reject
 
-    buy_signal = False
-    sell_signal = False
-    pattern = None
+    # --- Pattern B: range-compression breakout in trend direction ---
+    recent = df1h.iloc[-(CONSOLIDATION_LOOKBACK + 1):-1]
+    range_high, range_low = recent["high"].max(), recent["low"].min()
+    is_tight = pd.notna(last["atr_avg20"]) and last["atr"] < CONSOLIDATION_ATR_RATIO * last["atr_avg20"]
+    breakout_long = bias == "uptrend" and is_tight and last["close"] > range_high
+    breakout_short = bias == "downtrend" and is_tight and last["close"] < range_low
 
-    if bias == "uptrend" and macro_filter != "downtrend":
-        at_support = last["low"] <= swing_low * 1.005
-        micro_trend_up = last["ema_fast"] > last["ema_mid"]
-        if at_support and near_ema and micro_trend_up and rsi_buy_ok and bullish_reject:
-            buy_signal = True
-            pattern = "🟢 شراء من الدعم"
+    long_signal = pullback_long or breakout_long
+    short_signal = pullback_short or breakout_short
+    pattern = "pullback" if (pullback_long or pullback_short) else ("breakout" if (breakout_long or breakout_short) else None)
 
-        broke_high = prev["close"] > swing_high or last["close"] > swing_high
-        retesting = abs(last["close"] - swing_high) <= (last["atr"] * 0.7) or near_ema
-        if not buy_signal and broke_high and retesting and rsi_sell_ok and bearish_reject:
-            sell_signal = True
-            pattern = "🔴 بيع تصحيحي بعد كسر قمة"
-
-    elif bias == "downtrend" and macro_filter != "uptrend":
-        at_resistance = last["high"] >= swing_high * 0.995
-        micro_trend_down = last["ema_fast"] < last["ema_mid"]
-        if at_resistance and near_ema and micro_trend_down and rsi_sell_ok and bearish_reject:
-            sell_signal = True
-            pattern = "🔴 بيع من المقاومة"
-
-        broke_low = prev["close"] < swing_low or last["close"] < swing_low
-        retesting_low = abs(last["close"] - swing_low) <= (last["atr"] * 0.7) or near_ema
-        if not sell_signal and broke_low and retesting_low and rsi_buy_ok and bullish_reject:
-            buy_signal = True
-            pattern = "🟢 شراء تصحيحي بعد كسر قاع"
-
-    return buy_signal, sell_signal, last, pattern, (swing_high, swing_low)
+    return long_signal, short_signal, last, near_pullback, pattern
 
 
-# ============================================================
-# تيليجرام / الحالة
-# ============================================================
+def in_blackout_now():
+    now_et = datetime.now(ZoneInfo("America/New_York"))
+    if now_et.weekday() >= 5:
+        return False
+    hm = now_et.strftime("%H:%M")
+    return US_DATA_WINDOW[0] <= hm <= US_DATA_WINDOW[1] or FOMC_WINDOW[0] <= hm <= FOMC_WINDOW[1]
+
+
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    try:
-        requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": message}, timeout=15)
-    except Exception as e:
-        print(f"Telegram error: {e}")
+    full_message = "📊 Secondary Strategy\n" + message
+    requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": full_message}, timeout=15)
 
 
 def load_state():
@@ -213,106 +180,100 @@ def load_state():
 
 def save_state(state):
     with open(STATE_FILE, "w") as f:
-        json.dump(state, f, default=str)
+        json.dump(state, f)
 
 
-# ============================================================
-# MAIN
-# ============================================================
 def main():
     now_utc = datetime.now(timezone.utc)
+    if now_utc.weekday() >= 5:
+        print("Weekend — market closed, skipping.")
+        return
     today_str = now_utc.strftime("%Y-%m-%d")
+    hour = now_utc.hour
 
     state = load_state()
     if state.get("date") != today_str:
-        state = {"date": today_str, "last_alert_time": None, "signals_today": 0}
+        state = {"date": today_str, "last_alert_time": state.get("last_alert_time"),
+                  "overlap_start_sent": False, "overlap_end_warned": False,
+                  "last_status_hour": None}
 
-    for key in ["signals_today"]:
-        if key not in state:
-            state[key] = 0
-
-    save_state(state)
-
-    try:
-        df4h = fetch_candles(MACRO_INTERVAL, MACRO_OUTPUTSIZE)
-        df1h = fetch_candles(TREND_INTERVAL, TREND_OUTPUTSIZE)
-        df_m15 = fetch_candles(ENTRY_INTERVAL, ENTRY_OUTPUTSIZE)
-        df_m30 = fetch_candles("30min", ENTRY_OUTPUTSIZE)
-    except Exception as e:
-        print(f"خطأ في جلب البيانات: {e}")
-        return
-
-    if len(df4h) < 50 or len(df1h) < 50 or len(df_m15) < 30:
-        print("بيانات غير كافية.")
-        save_state(state)
-        return
-
-    macro_filter = get_macro_filter(df4h)
-    bias_h1 = get_trend_bias_h1(df1h)
-
-    buy_m15, sell_m15, last_m15, pattern_m15, swings_m15 = check_entry(df_m15, bias_h1, macro_filter)
-    buy_m30, sell_m30, last_m30, pattern_m30, swings_m30 = check_entry(df_m30, bias_h1, macro_filter)
-
-    if buy_m15 or sell_m15:
-        buy_signal, sell_signal = buy_m15, sell_m15
-        last, pattern = last_m15, pattern_m15
-        tf_used = "M15"
-    elif buy_m30 or sell_m30:
-        buy_signal, sell_signal = buy_m30, sell_m30
-        last, pattern = last_m30, pattern_m30
-        tf_used = "M30"
+    hour_key = f"{today_str}-{hour}"
+    if state.get("last_status_hour") == hour_key:
+        print("Already sent the hourly status for this hour (duplicate trigger). Skipping status, still checking signal silently.")
+        already_sent_status_this_hour = True
     else:
-        buy_signal = sell_signal = False
-        last = df_m15.iloc[-1]
-        pattern = None
-        tf_used = "—"
+        already_sent_status_this_hour = False
 
-    candle_time = str(last["datetime"])
-    blackout, blackout_event = in_news_blackout_now()
-
-    already_alerted = (state.get("last_alert_time") == candle_time)
-    signal_allowed = (buy_signal or sell_signal) and not already_alerted and not blackout
-    if signal_allowed and state["signals_today"] >= MAX_SIGNALS_PER_DAY:
-        signal_allowed = False
-
-    if not signal_allowed:
-        if blackout and (buy_signal or sell_signal):
-            print(f"إشارة موجودة لكن ممنوعة بسبب حظر خبر: {blackout_event}")
-        else:
-            print("لا توجد إشارة جديدة.")
+    if hour == OVERLAP_START_H and not state.get("overlap_start_sent"):
+        send_telegram("🚀 بدأت نافذة أفضل سيولة اليوم (لندن-نيويورك)! خليني أراقب بتركيز أكبر 👀")
+        state["overlap_start_sent"] = True
         save_state(state)
+
+    if hour == OVERLAP_END_H - 1 and not state.get("overlap_end_warned"):
+        send_telegram("⏳ باقي أقل من ساعة على انتهاء أفضل نافذة سيولة اليوم.")
+        state["overlap_end_warned"] = True
+        save_state(state)
+
+    df4h = fetch_candles(TREND_INTERVAL, TREND_OUTPUTSIZE)
+    if len(df4h) < EMA_MACRO + 5:
+        print("Not enough H4 data yet.")
+        save_state(state)
+        return
+    bias = get_trend_bias(df4h)
+
+    df1h = fetch_candles(ENTRY_INTERVAL, ENTRY_OUTPUTSIZE)
+    if len(df1h) < 30:
+        print("Not enough H1 data yet.")
+        save_state(state)
+        return
+    long_signal, short_signal, last, near_pullback, pattern = check_entry(df1h, bias)
+    candle_time = str(last["datetime"])
+    blackout = in_blackout_now()
+
+    parts = [random.choice(OPENERS)]
+    parts.append(f"💰 السعر الحالي: {last['close']:.2f}")
+    parts.append(random.choice(TREND_TALK[bias]))
+    parts.append(f"📊 RSI (H1): {last['rsi']:.1f} — {rsi_note(last['rsi'], bias)}")
+    parts.append(random.choice(BLACKOUT_ON if blackout else BLACKOUT_OFF))
+
+    already_alerted_this_candle = state.get("last_alert_time") == candle_time
+    if not (long_signal or short_signal) or already_alerted_this_candle:
+        parts.append(random.choice(CLOSERS_IDLE))
+
+    if not already_sent_status_this_hour:
+        send_telegram("\n".join(parts))
+        state["last_status_hour"] = hour_key
+        save_state(state)
+
+    if already_alerted_this_candle:
+        print("Already alerted for this candle.")
+        return
+    if not (long_signal or short_signal):
+        print("No trade signal this hour.")
+        return
+    if blackout:
+        print("Signal found but blackout active. Suppressed.")
         return
 
     atr = last["atr"]
     stop_dist = atr * ATR_STOP_MULT
     price = last["close"]
+    pattern_label = "ارتداد كلاسيكي 🔁" if pattern == "pullback" else "اختراق نطاق ضيق 💥"
 
-    if buy_signal:
-        if macro_filter == "downtrend":
-            save_state(state)
-            return
-        sl = price - stop_dist
-        tp1 = price + stop_dist * RR1
-        tp2 = price + stop_dist * RR2
-        msg = (f"🟢🚀 GOLD BUY\n📌 {pattern}\n⏱️ الإطار: {tf_used}\n📍 الدخول: {price:.2f}\n"
-               f"🛑 وقف الخسارة: {sl:.2f}\n🎯 TP1: {tp1:.2f} | TP2: {tp2:.2f}\n"
-               "⚠️ المخاطرة 0.5-1% من الحساب.")
+    if long_signal:
+        sl, tp1, tp2 = price - stop_dist, price + stop_dist * RR1, price + stop_dist * RR2
+        msg = (f"🟢🚀 GOLD BUY SIGNAL (XAUUSD)\nنمط الدخول: {pattern_label}\nEntry: {price:.2f}\n"
+               f"Stop Loss: {sl:.2f} 🛑\nTP1 (1:{RR1}): {tp1:.2f} 🎯\nTP2 (1:{RR2}): {tp2:.2f} 🎯🎯\n"
+               "Risk 0.5-1% of account. Confirm chart before entering ✅")
     else:
-        if macro_filter == "uptrend":
-            save_state(state)
-            return
-        sl = price + stop_dist
-        tp1 = price - stop_dist * RR1
-        tp2 = price - stop_dist * RR2
-        msg = (f"🔴🛑 GOLD SELL\n📌 {pattern}\n⏱️ الإطار: {tf_used}\n📍 الدخول: {price:.2f}\n"
-               f"🛑 وقف الخسارة: {sl:.2f}\n🎯 TP1: {tp1:.2f} | TP2: {tp2:.2f}\n"
-               "⚠️ المخاطرة 0.5-1% من الحساب.")
+        sl, tp1, tp2 = price + stop_dist, price - stop_dist * RR1, price - stop_dist * RR2
+        msg = (f"🔴🛑 GOLD SELL SIGNAL (XAUUSD)\nنمط الدخول: {pattern_label}\nEntry: {price:.2f}\n"
+               f"Stop Loss: {sl:.2f} 🛑\nTP1 (1:{RR1}): {tp1:.2f} 🎯\nTP2 (1:{RR2}): {tp2:.2f} 🎯🎯\n"
+               "Risk 0.5-1% of account. Confirm chart before entering ✅")
 
     send_telegram(msg)
     state["last_alert_time"] = candle_time
-    state["signals_today"] += 1
     save_state(state)
-    print(f"✅ إشارة أُرسلت: {pattern}")
 
 
 if __name__ == "__main__":
