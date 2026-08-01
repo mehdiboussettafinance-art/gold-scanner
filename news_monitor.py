@@ -34,6 +34,12 @@ EVENT_DIRECTION_HINTS = {
     "fed": "قرار متشدد (رفع فائدة/تصريح متشدد) = دولار أقوى (سلبي للذهب) والعكس صحيح",
 }
 
+IMPACT_SCORE_MAP = {"High": 9, "Medium": 5, "Low": 2}
+
+
+def impact_to_score(impact_label):
+    return IMPACT_SCORE_MAP.get(impact_label, 3)
+
 
 def get_direction_hint(event_name):
     name_lower = event_name.lower()
@@ -45,10 +51,15 @@ def get_direction_hint(event_name):
 
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    full_message = "📢 Forex News\n" + message
     try:
-        requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": message}, timeout=15)
+        requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": full_message}, timeout=15)
     except Exception as e:
         print(f"Telegram error: {e}")
+
+
+def is_weekend():
+    return datetime.now(ZoneInfo("America/New_York")).weekday() >= 5
 
 
 def load_state():
@@ -83,13 +94,14 @@ def fetch_today_high_impact_events():
         try:
             country = item.get("country", "")
             impact = item.get("impact", "")
-            if country != "US" or impact != "High":
+            if country != "US" or impact not in ("High", "Medium", "Low"):
                 continue
             event_time = datetime.strptime(item["date"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
             events.append({
                 "event": item.get("event", "حدث اقتصادي"),
                 "time_utc": event_time,
                 "impact": impact,
+                "score": impact_to_score(impact),
                 "actual": item.get("actual"),
                 "estimate": item.get("estimate"),
                 "previous": item.get("previous"),
@@ -108,7 +120,7 @@ def get_or_refresh_events(state):
         state["events_date"] = today_str
         state["todays_events"] = [
             {"event": e["event"], "time_utc": e["time_utc"].isoformat(), "impact": e["impact"],
-             "actual": e["actual"], "estimate": e["estimate"], "previous": e["previous"]}
+             "score": e["score"], "actual": e["actual"], "estimate": e["estimate"], "previous": e["previous"]}
             for e in events
         ]
         state["warned_60_keys"] = []
@@ -125,6 +137,8 @@ def check_and_warn_upcoming_news(state):
     warned30 = set(state.get("warned_30_keys", []))
 
     for e in state.get("todays_events", []):
+        if e.get("score", 0) < 7:
+            continue  # الأخبار المتوسطة/البسيطة تظهر بالملخص بس، بدون تذكير فردي
         event_time = datetime.fromisoformat(e["time_utc"])
         key = f"{e['event']}_{e['time_utc']}"
         minutes_until = (event_time - now_utc).total_seconds() / 60
@@ -161,13 +175,14 @@ def check_and_send_results(state):
         event_time = datetime.fromisoformat(e["time_utc"])
         key = f"{e['event']}_{e['time_utc']}"
         minutes_since = (now_utc - event_time).total_seconds() / 60
-        if minutes_since >= RESULT_CHECK_DELAY_MIN and key not in result_sent:
+        # نفحص بس خلال ساعتين بعد الخبر، لو تأخر أكثر من كذا نعتبره فات ونوقف المحاولة
+        if RESULT_CHECK_DELAY_MIN <= minutes_since <= 120 and key not in result_sent:
             pending.append((key, e, event_time))
 
     if not pending:
         return
 
-    fresh_events = fetch_today_high_impact_events()
+    fresh_events = fetch_today_high_impact_events()  # طلب FMP واحد بس، يغطي كل الأحداث المعلقة سوا
 
     for key, e, event_time in pending:
         match = next((f for f in fresh_events
@@ -182,6 +197,7 @@ def check_and_send_results(state):
         hint = get_direction_hint(e["event"])
         send_telegram(
             f"✅ نتيجة الخبر: {e['event']}\n"
+            f"⚡ قوة التأثير: {e.get('score', '?')}/10 ({e['impact']})\n"
             f"📊 الفعلي: {actual}\n"
             f"📈 المتوقع: {estimate}\n"
             f"📉 السابق: {previous}\n"
@@ -209,7 +225,7 @@ def send_4h_news_summary(state):
         lines = ["📅 ملخص أخبار اليوم المؤثرة على الدولار/الذهب:"]
         for e in sorted(events, key=lambda x: x["time_utc"]):
             t = datetime.fromisoformat(e["time_utc"]).astimezone(ZoneInfo("America/New_York")).strftime("%H:%M")
-            lines.append(f"• {e['event']} — {t} (نيويورك) — تأثير: {e['impact']} 🔴")
+            lines.append(f"• {e['event']} — {t} (نيويورك) — قوة التأثير: {e['score']}/10 ({e['impact']})")
         send_telegram("\n".join(lines))
 
     sent_hours.append(hour_key)
@@ -217,6 +233,10 @@ def send_4h_news_summary(state):
 
 
 def main():
+    if is_weekend():
+        print("Weekend — market closed, skipping news monitor.")
+        return
+
     state = load_state()
     state = get_or_refresh_events(state)
     check_and_warn_upcoming_news(state)
