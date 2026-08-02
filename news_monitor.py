@@ -21,7 +21,6 @@ STATE_FILE = "news_state.json"
 NEWS_WARNING_60_MIN = 60
 NEWS_WARNING_30_MIN = 30
 RESULT_CHECK_DELAY_MIN = 10
-SUMMARY_HOURS_UTC = [0, 4, 8, 12, 16, 20]
 
 EVENT_DIRECTION_HINTS = {
     "cpi": "أعلى من المتوقع = دولار أقوى غالبًا (سلبي للذهب) | أقل من المتوقع = العكس",
@@ -126,7 +125,7 @@ def get_or_refresh_events(state):
         state["warned_60_keys"] = []
         state["warned_30_keys"] = []
         state["result_sent_keys"] = []
-        state["summary_sent_hours"] = []
+        state["daily_summary_sent_date"] = None
         print(f"تحديث تقويم اليوم: {len(events)} حدث عالي التأثير")
     return state
 
@@ -209,27 +208,36 @@ def check_and_send_results(state):
     state["result_sent_keys"] = list(result_sent)
 
 
-def send_4h_news_summary(state):
-    now_utc = datetime.now(timezone.utc)
-    if now_utc.hour not in SUMMARY_HOURS_UTC:
-        return
-    hour_key = f"{state.get('events_date')}-{now_utc.hour}"
-    sent_hours = state.get("summary_sent_hours", [])
-    if hour_key in sent_hours:
-        return
+def send_daily_news_summary(state):
+    """
+    يرسل ملخص واحد بس باليوم، عند بداية يوم أمريكا (منتصف الليل بتوقيت نيويورك ET).
+    يعرض كل حدث بتوقيت أمريكا (ET) وبتوقيت UTC مع بعض.
+    """
+    now_et = datetime.now(ZoneInfo("America/New_York"))
+    today_et_str = now_et.strftime("%Y-%m-%d")
+
+    if now_et.hour != 0:
+        return  # نرسل بس بالساعة 00:xx بتوقيت نيويورك (بداية يوم أمريكا)
+
+    if state.get("daily_summary_sent_date") == today_et_str:
+        return  # سبق أرسلناها اليوم
 
     events = state.get("todays_events", [])
     if not events:
-        send_telegram("📅 ملخص اليوم: ما فيه أخبار أمريكية عالية التأثير مسجلة اليوم.")
+        send_telegram(f"📅 ملخص يوم {today_et_str}: ما فيه أخبار أمريكية مسجلة اليوم.")
     else:
-        lines = ["📅 ملخص أخبار اليوم المؤثرة على الدولار/الذهب:"]
+        lines = [f"📅 ملخص أخبار يوم {today_et_str} المؤثرة على الدولار/الذهب:"]
         for e in sorted(events, key=lambda x: x["time_utc"]):
-            t = datetime.fromisoformat(e["time_utc"]).astimezone(ZoneInfo("America/New_York")).strftime("%H:%M")
-            lines.append(f"• {e['event']} — {t} (نيويورك) — قوة التأثير: {e['score']}/10 ({e['impact']})")
+            event_time_utc = datetime.fromisoformat(e["time_utc"])
+            t_et = event_time_utc.astimezone(ZoneInfo("America/New_York")).strftime("%H:%M")
+            t_utc = event_time_utc.strftime("%H:%M")
+            lines.append(
+                f"• {e['event']}\n"
+                f"  🇺🇸 {t_et} (أمريكا) | 🌐 {t_utc} UTC — قوة التأثير: {e['score']}/10 ({e['impact']})"
+            )
         send_telegram("\n".join(lines))
 
-    sent_hours.append(hour_key)
-    state["summary_sent_hours"] = sent_hours
+    state["daily_summary_sent_date"] = today_et_str
 
 
 def main():
@@ -241,7 +249,7 @@ def main():
     state = get_or_refresh_events(state)
     check_and_warn_upcoming_news(state)
     check_and_send_results(state)
-    send_4h_news_summary(state)
+    send_daily_news_summary(state)
     save_state(state)
     print("News monitor run complete.")
 
