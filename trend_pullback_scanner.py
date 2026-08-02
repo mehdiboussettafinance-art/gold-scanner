@@ -1,11 +1,13 @@
 """
 XAUUSD Trend-Pullback Scanner PRO — 15min
 مع وقف خسارة وأهداف + نصائح نفسية + تنبيهات أخبار
++ آلية إعادة المحاولة + رسائل افتتاح/إغلاق السوق
 """
 
 import os
 import json
 import random
+import time
 import requests
 import pandas as pd
 from datetime import datetime, timedelta, timezone
@@ -32,6 +34,10 @@ ATR_LEN    = 14
 ATR_STOP_MULT = 1.5
 RR1 = 1.0
 RR2 = 2.0
+
+# ---------- أوقات السوق (UTC) ----------
+MARKET_OPEN_HOUR = 22   # الأحد الساعة 22:00
+MARKET_CLOSE_HOUR = 22  # الجمعة الساعة 22:00
 
 # ---------- نصائح نفسية ----------
 PSYCH_TIPS = [
@@ -66,6 +72,8 @@ def init_state_file():
             "warned_us_data": False,
             "warned_fomc": False,
             "weekly_news_sent": False,
+            "market_open_week": None,   # يحفظ تاريخ بداية الأسبوع الذي أُرسلت فيه رسالة الافتتاح
+            "market_close_week": None,  # يحفظ تاريخ نهاية الأسبوع الذي أُرسلت فيه رسالة الإغلاق
         }
         with open(STATE_FILE, "w") as f:
             json.dump(initial_state, f)
@@ -84,29 +92,39 @@ def in_news_blackout():
 
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": message}, timeout=15)
+    try:
+        requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": message}, timeout=15)
+    except Exception as e:
+        print(f"فشل إرسال رسالة تيليجرام: {e}")
 
 
-def fetch_candles(interval, outputsize):
+def fetch_candles(interval, outputsize, retries=3, delay=5):
+    """جلب الشموع مع إعادة المحاولة عند الفشل"""
     url = "https://api.twelvedata.com/time_series"
     params = {"symbol": SYMBOL, "interval": interval, "outputsize": outputsize,
               "apikey": TWELVE_DATA_KEY, "order": "ASC"}
-    r = requests.get(url, params=params, timeout=30)
-    data = r.json()
-    if "values" not in data:
-        raise RuntimeError(f"Twelve Data error: {data}")
-    df = pd.DataFrame(data["values"])
-    df["datetime"] = pd.to_datetime(df["datetime"]).dt.tz_localize("UTC")
-    for col in ["open", "high", "low", "close"]:
-        df[col] = df[col].astype(float)
-    return df.sort_values("datetime").reset_index(drop=True)
+    for attempt in range(1, retries + 1):
+        try:
+            r = requests.get(url, params=params, timeout=30)
+            data = r.json()
+            if "values" not in data:
+                raise RuntimeError(f"Twelve Data error: {data}")
+            df = pd.DataFrame(data["values"])
+            df["datetime"] = pd.to_datetime(df["datetime"]).dt.tz_localize("UTC")
+            for col in ["open", "high", "low", "close"]:
+                df[col] = df[col].astype(float)
+            return df.sort_values("datetime").reset_index(drop=True)
+        except Exception as e:
+            print(f"محاولة {attempt} فشلت: {e}")
+            if attempt < retries:
+                time.sleep(delay)
+            else:
+                send_telegram("⚠️ فشل جلب بيانات XAUUSD بعد عدة محاولات. ربما فاتتنا إشارة.")
+                raise
 
 
 def drop_unclosed_candle(df, interval_minutes=15):
-    """
-    يتأكد إن آخر شمعة قفلت فعليًا قبل ما نحسب عليها أي شي.
-    لو لسا ما وصل وقت إغلاقها المتوقع، نحذفها ونستخدم اللي قبلها.
-    """
+    """يحذف الشمعة الحالية إن لم تكن قد أغلقت بعد"""
     now_utc = datetime.now(timezone.utc)
     last_open = df.iloc[-1]["datetime"]
     if last_open.tzinfo is None:
@@ -224,14 +242,63 @@ def check_news_warnings(state):
         save_state(state)
 
 
+def is_market_open(now_utc):
+    """يعيد True إذا كان السوق مفتوحاً الآن (بين الأحد 22:00 والجمعة 22:00)"""
+    # حساب بداية الأسبوع (الاثنين 00:00) لكن السوق يفتح الأحد 22:00
+    weekday = now_utc.weekday()
+    hour = now_utc.hour
+    # الأحد (6) بعد 22:00 مفتوح
+    if weekday == 6 and hour >= MARKET_OPEN_HOUR:
+        return True
+    # الاثنين (0) إلى الخميس (3) مفتوح طوال اليوم
+    if 0 <= weekday <= 3:
+        return True
+    # الجمعة (4) قبل 22:00 مفتوح
+    if weekday == 4 and hour < MARKET_CLOSE_HOUR:
+        return True
+    return False
+
+
+def get_current_week_monday(now_utc):
+    """يرجع تاريخ الاثنين من الأسبوع الحالي (يستخدم لتوحيد معرفات الأسابيع)"""
+    return (now_utc - timedelta(days=now_utc.weekday())).date()
+
+
+def check_market_open_close_messages(state, now_utc):
+    """ترسل رسالة افتتاح أو إغلاق السوق إذا لزم الأمر"""
+    if is_market_open(now_utc):
+        # السوق مفتوح – تحقق من رسالة الافتتاح
+        week_monday = get_current_week_monday(now_utc)
+        if state.get("market_open_week") != str(week_monday):
+            send_telegram(f"🔔 سوق الفوركس افتتح الآن! (الأحد 22:00 UTC)\n💡 استعد لبدء أسبوع تداول جديد. الإشارات ستصلك تباعاً.")
+            state["market_open_week"] = str(week_monday)
+            save_state(state)
+    else:
+        # السوق مغلق – تحقق من رسالة الإغلاق (إذا كان الوقت بعد إغلاق الجمعة)
+        # الرسالة ترسل مرة واحدة بعد الجمعة 22:00 وحتى نهاية الأحد 21:59
+        if now_utc.weekday() == 4 and now_utc.hour >= MARKET_CLOSE_HOUR or now_utc.weekday() == 5 or (now_utc.weekday() == 6 and now_utc.hour < MARKET_OPEN_HOUR):
+            week_monday = get_current_week_monday(now_utc)  # الاثنين من نفس الأسبوع
+            if state.get("market_close_week") != str(week_monday):
+                send_telegram(f"🔕 سوق الفوركس أُغلق للتو (الجمعة 22:00 UTC).\n🛑 تم إيقاف فحص الإشارات حتى الأحد 22:00 UTC.")
+                state["market_close_week"] = str(week_monday)
+                save_state(state)
+
+
 def main():
     init_state_file()
 
     now_utc = datetime.now(timezone.utc)
-    if now_utc.weekday() >= 5:
-        print("نهاية الأسبوع — السوق مقفل، ما نرسل شي.")
+
+    # رسائل افتتاح / إغلاق السوق (تعمل حتى لو السوق مقفل)
+    state = load_state()
+    check_market_open_close_messages(state, now_utc)
+
+    # إذا السوق مقفل نتوقف هنا (ما عدا أول مرة بعد الإغلاق أرسلت الرسالة أعلاه)
+    if not is_market_open(now_utc):
+        print("السوق مقفل حالياً – لا يتم فحص الإشارات.")
         return
 
+    # السوق مفتوح – نكمل الفحص الطبيعي
     df = fetch_candles("15min", 500)
     df = drop_unclosed_candle(df, interval_minutes=15)
     if len(df) < 201:
@@ -241,8 +308,6 @@ def main():
     df = compute_indicators(df)
     last_candle_time = df.iloc[-1]["datetime"]
     candle_time_str = last_candle_time.strftime("%Y-%m-%d %H:%M")
-
-    state = load_state()
 
     # إعادة تعيين تحذيرات اليوم عند منتصف الليل بتوقيت نيويورك
     today_et_str = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
