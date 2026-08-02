@@ -1,6 +1,6 @@
 """
 XAUUSD Trend-Pullback Scanner PRO — 15min
-مع وقف خسارة وأهداف + نصائح نفسية + تنبيهات أخبار + رسالة تأكيد تشغيل
+مع وقف خسارة وأهداف + نصائح نفسية + تنبيهات أخبار
 """
 
 import os
@@ -32,9 +32,6 @@ ATR_LEN    = 14
 ATR_STOP_MULT = 1.5
 RR1 = 1.0
 RR2 = 2.0
-
-# ---------- إعدادات رسالة الحالة ----------
-STATUS_INTERVAL_HOURS = 4   # كل كم ساعة تيجيك رسالة تأكيد التشغيل
 
 # ---------- نصائح نفسية ----------
 PSYCH_TIPS = [
@@ -69,7 +66,6 @@ def init_state_file():
             "warned_us_data": False,
             "warned_fomc": False,
             "weekly_news_sent": False,
-            "last_status_sent": None
         }
         with open(STATE_FILE, "w") as f:
             json.dump(initial_state, f)
@@ -79,7 +75,11 @@ def init_state_file():
 def in_news_blackout():
     now_et = datetime.now(ZoneInfo("America/New_York"))
     hm = now_et.strftime("%H:%M")
-    return US_DATA_WINDOW[0] <= hm <= US_DATA_WINDOW[1] or FOMC_WINDOW[0] <= hm <= FOMC_WINDOW[1]
+    if US_DATA_WINDOW[0] <= hm <= US_DATA_WINDOW[1]:
+        return True, "بيانات اقتصادية أمريكية (CPI/NFP/PPI/مبيعات التجزئة)"
+    if FOMC_WINDOW[0] <= hm <= FOMC_WINDOW[1]:
+        return True, "اجتماع أو تصريح الفيدرالي (FOMC)"
+    return False, None
 
 
 def send_telegram(message):
@@ -100,6 +100,22 @@ def fetch_candles(interval, outputsize):
     for col in ["open", "high", "low", "close"]:
         df[col] = df[col].astype(float)
     return df.sort_values("datetime").reset_index(drop=True)
+
+
+def drop_unclosed_candle(df, interval_minutes=15):
+    """
+    يتأكد إن آخر شمعة قفلت فعليًا قبل ما نحسب عليها أي شي.
+    لو لسا ما وصل وقت إغلاقها المتوقع، نحذفها ونستخدم اللي قبلها.
+    """
+    now_utc = datetime.now(timezone.utc)
+    last_open = df.iloc[-1]["datetime"]
+    if last_open.tzinfo is None:
+        last_open = last_open.tz_localize("UTC")
+    expected_close = last_open + pd.Timedelta(minutes=interval_minutes)
+    if now_utc < expected_close:
+        print(f"آخر شمعة ({last_open}) لسا ما قفلت (تقفل عند {expected_close}). نحذفها.")
+        return df.iloc[:-1].reset_index(drop=True)
+    return df
 
 
 def load_state():
@@ -208,63 +224,16 @@ def check_news_warnings(state):
         save_state(state)
 
 
-def send_status_message(state, df):
-    """يرسل رسالة تأكيد تشغيل مع بيانات المؤشرات (كل 4 ساعات مثلاً)"""
-    now_utc = datetime.now(timezone.utc)
-    last_sent = state.get("last_status_sent")
-    if last_sent:
-        last_sent_dt = datetime.fromisoformat(last_sent)
-        if now_utc - last_sent_dt < timedelta(hours=STATUS_INTERVAL_HOURS):
-            return  # ما مرّ وقت كافٍ
-
-    row = df.iloc[-1]
-    price = row["close"]
-    ema20 = row["ema20"]
-    ema50 = row["ema50"]
-    ema200 = row["ema200"]
-    rsi_val = row["rsi"]
-    atr_val = row["atr"]
-    dist_from_ema20 = abs(price - ema20)
-    pullback_limit = atr_val * PULLBACK_ATR_MULT
-
-    # تحديد الاتجاه
-    if price > ema50 and ema50 > ema200:
-        trend = "صاعد 📈"
-    elif price < ema50 and ema50 < ema200:
-        trend = "هابط 📉"
-    else:
-        trend = "محايد ↔️"
-
-    blackout = in_news_blackout()
-    near_zone = dist_from_ema20 <= pullback_limit
-
-    msg = (
-        f"{EMOJI_CHECK} **تأكيد تشغيل البوت – كل الأنظمة تعمل**\n\n"
-        f"💰 السعر الحالي: {price:.2f}\n"
-        f"────────────────────\n"
-        f"🔹 EMA 20: {ema20:.2f}\n"
-        f"🔹 EMA 50: {ema50:.2f}\n"
-        f"🔹 EMA 200: {ema200:.2f}\n"
-        f"🔹 RSI 14: {rsi_val:.1f}\n"
-        f"🔹 ATR 14: {atr_val:.2f}\n"
-        f"────────────────────\n"
-        f"📏 المسافة عن EMA20: {dist_from_ema20:.2f} (الحد المسموح: {pullback_limit:.2f})\n"
-        f"🌊 حالة الاتجاه: {trend}\n"
-        f"🔎 داخل منطقة الارتداد: {'نعم ✅' if near_zone else 'لا ❌'}\n"
-        f"🚫 حظر الأخبار نشط: {'نعم ⚠️' if blackout else 'لا'}\n"
-        f"────────────────────\n"
-        f"⏱️ وقت الشمعة الأخيرة: {row['datetime'].strftime('%Y-%m-%d %H:%M UTC')}\n"
-        f"🔄 سيتم فحص الإشارات حسب الاستراتيجية كل 15 دقيقة."
-    )
-    send_telegram(msg)
-    state["last_status_sent"] = now_utc.isoformat()
-    save_state(state)
-
-
 def main():
     init_state_file()
 
+    now_utc = datetime.now(timezone.utc)
+    if now_utc.weekday() >= 5:
+        print("نهاية الأسبوع — السوق مقفل، ما نرسل شي.")
+        return
+
     df = fetch_candles("15min", 500)
+    df = drop_unclosed_candle(df, interval_minutes=15)
     if len(df) < 201:
         print("بيانات غير كافية")
         return
@@ -283,9 +252,6 @@ def main():
         state["warned_fomc"] = False
         state["weekly_news_sent"] = False
 
-    # ----- إرسال رسالة تأكيد التشغيل (كل 4 ساعات) -----
-    send_status_message(state, df)
-
     check_weekly_news(state)
     check_news_warnings(state)
 
@@ -295,7 +261,7 @@ def main():
         return
 
     longRaw, shortRaw = check_signal(df)
-    blackout = in_news_blackout()
+    blackout, blackout_reason = in_news_blackout()
     row = df.iloc[-1]
     price = row["close"]
     atr_val = row["atr"]
@@ -316,7 +282,8 @@ def main():
         if not blackout:
             emoji = EMOJI_BUY if direction == "long" else EMOJI_SELL
             action = "شراء" if direction == "long" else "بيع"
-            msg = (f"[TREND-PULLBACK] 📈\n"
+            msg = (f"🎯 Principal Strategy\n"
+                   f"[TREND-PULLBACK] 📈\n"
                    f"{emoji} {action} XAUUSD على فريم 15 دقيقة\n"
                    f"السعر الآن: {price:.2f}\n"
                    f"وقف الخسارة: {sl:.2f} 🛑\n"
@@ -327,7 +294,9 @@ def main():
             send_telegram(msg)
         else:
             action = "شراء" if direction == "long" else "بيع"
-            msg = (f"{EMOJI_BLOCK} إشارة {action} مُنعت بسبب حظر الأخبار\n"
+            msg = (f"🎯 Principal Strategy\n"
+                   f"{EMOJI_BLOCK} إشارة {action} مُنعت بسبب حظر الأخبار\n"
+                   f"📰 الخبر: {blackout_reason}\n"
                    f"السعر: {price:.2f}\n"
                    f"الوقت: {candle_time_str} UTC\n\n"
                    f"🧘 نصيحة: \"{tip}\"")
@@ -337,6 +306,8 @@ def main():
         save_state(state)
     else:
         print("لا توجد إشارة جديدة")
+
+    save_state(state)
 
 
 if __name__ == "__main__":
