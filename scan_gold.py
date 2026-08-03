@@ -64,6 +64,22 @@ BLACKOUT_ON  = ["🔇 فيه حظر أخبار شغال حاليًا، حتى ل
 BLACKOUT_OFF = ["🔊 ما فيه حظر أخبار حاليًا، الطريق مفتوح لو صارت إشارة."]
 
 
+def drop_unclosed_candle(df, interval_minutes):
+    """
+    يتأكد إن آخر شمعة قفلت فعليًا قبل ما نحسب عليها — نفس الحماية
+    اللي عندنا بملف M15، هنا بفترة الساعة (60 دقيقة).
+    """
+    now_utc = datetime.now(timezone.utc)
+    last_open = df.iloc[-1]["datetime"]
+    if last_open.tzinfo is None:
+        last_open = last_open.tz_localize("UTC")
+    expected_close = last_open + pd.Timedelta(minutes=interval_minutes)
+    if now_utc < expected_close:
+        print(f"آخر شمعة ({last_open}) لسا ما قفلت (تقفل عند {expected_close}). نحذفها.")
+        return df.iloc[:-1].reset_index(drop=True)
+    return df
+
+
 def rsi_note(rsi_val, direction_hint):
     if direction_hint == "uptrend":
         if RSI_LOW <= rsi_val <= RSI_HIGH:
@@ -79,7 +95,7 @@ def rsi_note(rsi_val, direction_hint):
 def fetch_candles(interval, outputsize):
     url = "https://api.twelvedata.com/time_series"
     params = {"symbol": SYMBOL, "interval": interval, "outputsize": outputsize,
-              "apikey": TWELVE_DATA_KEY, "order": "ASC"}
+              "apikey": TWELVE_DATA_KEY, "order": "ASC", "timezone": "UTC"}
     r = requests.get(url, params=params, timeout=30)
     data = r.json()
     if "values" not in data:
@@ -194,15 +210,7 @@ def main():
     state = load_state()
     if state.get("date") != today_str:
         state = {"date": today_str, "last_alert_time": state.get("last_alert_time"),
-                  "overlap_start_sent": False, "overlap_end_warned": False,
-                  "last_status_hour": None}
-
-    hour_key = f"{today_str}-{hour}"
-    if state.get("last_status_hour") == hour_key:
-        print("Already sent the hourly status for this hour (duplicate trigger). Skipping status, still checking signal silently.")
-        already_sent_status_this_hour = True
-    else:
-        already_sent_status_this_hour = False
+                  "overlap_start_sent": False, "overlap_end_warned": False}
 
     if hour == OVERLAP_START_H and not state.get("overlap_start_sent"):
         send_telegram("🚀 بدأت نافذة أفضل سيولة اليوم (لندن-نيويورك)! خليني أراقب بتركيز أكبر 👀")
@@ -215,6 +223,7 @@ def main():
         save_state(state)
 
     df4h = fetch_candles(TREND_INTERVAL, TREND_OUTPUTSIZE)
+    df4h = drop_unclosed_candle(df4h, interval_minutes=240)
     if len(df4h) < EMA_MACRO + 5:
         print("Not enough H4 data yet.")
         save_state(state)
@@ -222,6 +231,7 @@ def main():
     bias = get_trend_bias(df4h)
 
     df1h = fetch_candles(ENTRY_INTERVAL, ENTRY_OUTPUTSIZE)
+    df1h = drop_unclosed_candle(df1h, interval_minutes=60)
     if len(df1h) < 30:
         print("Not enough H1 data yet.")
         save_state(state)
@@ -230,29 +240,18 @@ def main():
     candle_time = str(last["datetime"])
     blackout = in_blackout_now()
 
-    parts = [random.choice(OPENERS)]
-    parts.append(f"💰 السعر الحالي: {last['close']:.2f}")
-    parts.append(random.choice(TREND_TALK[bias]))
-    parts.append(f"📊 RSI (H1): {last['rsi']:.1f} — {rsi_note(last['rsi'], bias)}")
-    parts.append(random.choice(BLACKOUT_ON if blackout else BLACKOUT_OFF))
-
     already_alerted_this_candle = state.get("last_alert_time") == candle_time
-    if not (long_signal or short_signal) or already_alerted_this_candle:
-        parts.append(random.choice(CLOSERS_IDLE))
-
-    if not already_sent_status_this_hour:
-        send_telegram("\n".join(parts))
-        state["last_status_hour"] = hour_key
-        save_state(state)
-
     if already_alerted_this_candle:
         print("Already alerted for this candle.")
+        save_state(state)
         return
     if not (long_signal or short_signal):
         print("No trade signal this hour.")
+        save_state(state)
         return
     if blackout:
         print("Signal found but blackout active. Suppressed.")
+        save_state(state)
         return
 
     atr = last["atr"]
