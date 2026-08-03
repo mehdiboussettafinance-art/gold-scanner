@@ -279,6 +279,27 @@ def main():
 
         tip = random.choice(PSYCH_TIPS)
 
+        # تقدير تقريبي بحت لعدد الشمعات المتوقعة للوصول للهدف، بناءً على متوسط الحركة (ATR)
+        # هذا ليس تنبؤاً مؤكداً — السعر لا يتحرك بخط مستقيم، والوقت الفعلي ممكن يختلف كثيراً
+        candles_to_tp1 = max(1, round(abs(tp1 - price) / atr_val)) if atr_val > 0 else None
+        candles_to_tp2 = max(1, round(abs(tp2 - price) / atr_val)) if atr_val > 0 else None
+        time_tp1_min = candles_to_tp1 * 15 if candles_to_tp1 else None
+        time_tp2_min = candles_to_tp2 * 15 if candles_to_tp2 else None
+
+        def fmt_time(minutes):
+            if minutes is None:
+                return "غير محدد"
+            if minutes < 60:
+                return f"~{minutes} دقيقة"
+            hours = minutes / 60
+            return f"~{hours:.1f} ساعة"
+
+        time_estimate_line = (
+            f"⏱️ تقدير تقريبي (مو مضمون): الهدف 1 خلال {fmt_time(time_tp1_min)} | "
+            f"الهدف 2 خلال {fmt_time(time_tp2_min)}\n"
+            f"⚠️ تقدير إحصائي بناءً على متوسط التقلب الحالي فقط، مو تنبؤ فعلي."
+        )
+
         if not blackout:
             emoji = EMOJI_BUY if direction == "long" else EMOJI_SELL
             action = "شراء" if direction == "long" else "بيع"
@@ -289,6 +310,7 @@ def main():
                    f"وقف الخسارة: {sl:.2f} 🛑\n"
                    f"الهدف 1 (1:{RR1:.1f}): {tp1:.2f} 🎯\n"
                    f"الهدف 2 (1:{RR2:.1f}): {tp2:.2f} 🚀\n"
+                   f"{time_estimate_line}\n"
                    f"الوقت: {candle_time_str} UTC\n\n"
                    f"🧘 نصيحة: \"{tip}\"")
             send_telegram(msg)
